@@ -1,7 +1,9 @@
 #include "usb_can_service.h"
 
 #include <QDateTime>
+#include <QHash>
 #include <QRegularExpression>
+#include <QStringList>
 #include <QThread>
 
 #include <cstring>
@@ -20,6 +22,16 @@ UsbCanService::~UsbCanService()
 bool UsbCanService::isConnected() const
 {
     return connected_.load();
+}
+
+bool UsbCanService::isNmeaMonitorMode() const
+{
+    return nmeaMonitorMode_.load();
+}
+
+void UsbCanService::setNmeaMonitorMode(bool enabled)
+{
+    nmeaMonitorMode_.store(enabled);
 }
 
 void UsbCanService::connectDevice(quint32 deviceIndex, quint32 channelIndex, const QString& baudRate, bool listenOnly, bool singleFilter)
@@ -80,6 +92,10 @@ void UsbCanService::connectDevice(quint32 deviceIndex, quint32 channelIndex, con
 
     deviceIndex_ = deviceIndex;
     channelIndex_ = channelIndex;
+    listenOnly_ = listenOnly;
+    hasTimestampBase_ = false;
+    timestampBaseTicks_ = 0;
+    timestampBaseSystemMs_ = 0;
     stopReceive_.store(false);
     connected_.store(true);
     receiveThread_ = std::thread(&UsbCanService::receiveLoop, this);
@@ -101,13 +117,25 @@ void UsbCanService::disconnectDevice()
     auto& native = ControlCanNative::instance();
     native.resetCan(ControlCanNative::VciUsbCan2, deviceIndex_, channelIndex_);
     native.closeDevice(ControlCanNative::VciUsbCan2, deviceIndex_);
+    listenOnly_ = false;
     emitLog("Disconnected.");
 }
 
 void UsbCanService::sendFrame(quint32 canId, const QByteArray& payload, bool extendedFrame, bool remoteFrame)
 {
+    std::lock_guard lock(nativeMutex_);
     if (!connected_.load()) {
         throw std::runtime_error("Device is not connected.");
+    }
+    if (listenOnly_ || nmeaMonitorMode_.load()) {
+        throw std::runtime_error("Transmit is disabled while the adapter is in receive-only monitoring mode.");
+    }
+    if (extendedFrame) {
+        if (canId > 0x1FFFFFFF) {
+            throw std::runtime_error("Extended CAN ID must be 29 bits or less.");
+        }
+    } else if (canId > 0x7FF) {
+        throw std::runtime_error("Standard CAN ID must be 11 bits or less. Enable Extended for IDs above 0x7FF.");
     }
     if (payload.size() > 8) {
         throw std::runtime_error("CAN payload may contain at most 8 bytes.");
@@ -121,13 +149,40 @@ void UsbCanService::sendFrame(quint32 canId, const QByteArray& payload, bool ext
     frame.dataLen = static_cast<quint8>(payload.size());
     std::memcpy(frame.data, payload.constData(), static_cast<size_t>(payload.size()));
 
-    std::lock_guard lock(nativeMutex_);
     const quint32 sent = ControlCanNative::instance().transmit(ControlCanNative::VciUsbCan2, deviceIndex_, channelIndex_, &frame, 1);
     if (sent != 1) {
-        throw std::runtime_error("VCI_Transmit failed.");
+        throw std::runtime_error(transmitErrorDetails(canId, payload.size(), extendedFrame, remoteFrame, sent).toStdString());
     }
 
     emitLog(QString("TX %1 [%2] %3").arg(formatId(canId, extendedFrame)).arg(payload.size()).arg(formatBytes(payload)));
+}
+
+QString UsbCanService::transmitErrorDetails(quint32 canId, int payloadSize, bool extendedFrame, bool remoteFrame, quint32 sent) const
+{
+    QString message = QString("VCI_Transmit failed (sent %1/1, device %2, channel %3, id %4, len %5, type %6, rtr %7).")
+                          .arg(sent)
+                          .arg(deviceIndex_)
+                          .arg(channelIndex_)
+                          .arg(formatId(canId, extendedFrame))
+                          .arg(payloadSize)
+                          .arg(extendedFrame ? "EXT" : "STD")
+                          .arg(remoteFrame ? "yes" : "no");
+
+    ControlCanNative::VciErrInfo errorInfo {};
+    if (ControlCanNative::instance().readErrInfo(ControlCanNative::VciUsbCan2, deviceIndex_, channelIndex_, &errorInfo)) {
+        const auto hexByte = [](quint8 value) {
+            return QString("%1").arg(value, 2, 16, QLatin1Char('0')).toUpper();
+        };
+        message += QString(" Adapter error: code 0x%1, passive [%2 %3 %4], arbitration-lost 0x%5.")
+                       .arg(errorInfo.errCode, 8, 16, QLatin1Char('0'))
+                       .arg(hexByte(errorInfo.passiveErrData[0]))
+                       .arg(hexByte(errorInfo.passiveErrData[1]))
+                       .arg(hexByte(errorInfo.passiveErrData[2]))
+                       .arg(hexByte(errorInfo.arLostErrData));
+    }
+
+    message += " Check Normal mode, matching baud rate, CAN-H/CAN-L wiring, termination, and that another node can ACK the frame.";
+    return message;
 }
 
 QByteArray UsbCanService::parsePayload(const QString& text)
@@ -189,11 +244,11 @@ void UsbCanService::receiveLoop()
             }
 
             if (available == 0) {
-                QThread::msleep(50);
+                QThread::msleep(10);
                 continue;
             }
 
-            const int fetchCount = static_cast<int>(qMin<quint32>(available, 128));
+            const int fetchCount = static_cast<int>(qMin<quint32>(available, 512));
             QVector<ControlCanNative::VciCanObj> buffer(fetchCount);
             quint32 received = 0;
             {
@@ -201,11 +256,22 @@ void UsbCanService::receiveLoop()
                 received = ControlCanNative::instance().receive(ControlCanNative::VciUsbCan2, deviceIndex_, channelIndex_, buffer.data(), fetchCount, 50);
             }
 
+            QVector<CanFrame> rawFrames;
+            rawFrames.reserve(static_cast<int>(qMin<quint32>(received, 512)));
+            QVector<CanFrame> frames;
+            frames.reserve(static_cast<int>(qMin<quint32>(received, 128)));
+            QHash<QString, int> frameIndexByKey;
             for (quint64 i = 0; i < received; ++i) {
                 const auto& raw = buffer[static_cast<int>(i)];
+                const QDateTime now = QDateTime::currentDateTime();
+                const QDateTime frameTime = frameDateTime(raw, now);
                 QByteArray data(reinterpret_cast<const char*>(raw.data), raw.dataLen);
                 CanFrame frame;
-                frame.timestamp = QDateTime::currentDateTime().toString("HH:mm:ss.zzz");
+                frame.timestamp = frameTime.toString("HH:mm:ss.zzz");
+                frame.firstSeenTimestamp = frame.timestamp;
+                frame.lastSeenTimestamp = frame.timestamp;
+                frame.firstSeenMs = frameTime.toMSecsSinceEpoch();
+                frame.lastSeenMs = frame.firstSeenMs;
                 frame.channel = QString::number(channelIndex_);
                 frame.idText = formatId(raw.id, raw.externFlag == 1);
                 frame.rawId = raw.id;
@@ -213,13 +279,50 @@ void UsbCanService::receiveLoop()
                 frame.length = raw.dataLen;
                 frame.dataBytes = data;
                 frame.dataText = formatBytes(data);
-                emit frameReceived(frame);
+                rawFrames.push_back(frame);
+
+                const QString key = QString("%1|%2|%3").arg(frame.channel, QString::number(frame.rawId, 16), frame.frameType);
+                const auto existing = frameIndexByKey.constFind(key);
+                if (existing == frameIndexByKey.cend()) {
+                    frameIndexByKey.insert(key, frames.size());
+                    frames.push_back(frame);
+                } else {
+                    const int existingIndex = existing.value();
+                    const int batchSeen = frames[existingIndex].seenCount + 1;
+                    frames[existingIndex] = frame;
+                    frames[existingIndex].seenCount = batchSeen;
+                }
+            }
+
+            if (!rawFrames.isEmpty()) {
+                emit rawFramesReceived(rawFrames);
+            }
+            if (!frames.isEmpty()) {
+                emit framesReceived(frames);
             }
         } catch (const std::exception& ex) {
             emitLog(QString("RX loop error: %1").arg(ex.what()));
             QThread::msleep(200);
         }
     }
+}
+
+QDateTime UsbCanService::frameDateTime(const ControlCanNative::VciCanObj& frame, const QDateTime& fallbackTime)
+{
+    if (frame.timeFlag == 0) {
+        return fallbackTime;
+    }
+
+    if (!hasTimestampBase_) {
+        hasTimestampBase_ = true;
+        timestampBaseTicks_ = frame.timeStamp;
+        timestampBaseSystemMs_ = fallbackTime.toMSecsSinceEpoch();
+        return fallbackTime;
+    }
+
+    const quint32 elapsedTicks = frame.timeStamp - timestampBaseTicks_;
+    const qint64 elapsedMs = static_cast<qint64>(elapsedTicks) / 10;
+    return QDateTime::fromMSecsSinceEpoch(timestampBaseSystemMs_ + elapsedMs);
 }
 
 void UsbCanService::emitLog(const QString& message)

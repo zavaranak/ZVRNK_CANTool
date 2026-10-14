@@ -3,12 +3,14 @@
 #include "control_can_native.h"
 #include "formula_evaluator.h"
 
+#include <QAbstractButton>
 #include <QApplication>
 #include <QAbstractItemView>
 #include <QCheckBox>
 #include <QComboBox>
 #include <QFileDialog>
 #include <QFile>
+#include <QFontDatabase>
 #include <QGridLayout>
 #include <QGroupBox>
 #include <QHeaderView>
@@ -19,8 +21,13 @@
 #include <QMessageBox>
 #include <QPushButton>
 #include <QRegularExpression>
+#include <QResizeEvent>
+#include <QStyle>
+#include <QSignalBlocker>
 #include <QSizePolicy>
 #include <QSplitter>
+#include <QStandardPaths>
+#include <QTableView>
 #include <QTableWidget>
 #include <QTextEdit>
 #include <QTextStream>
@@ -45,6 +52,13 @@ void relaxTable(QTableWidget* table)
     table->horizontalHeader()->setMinimumSectionSize(1);
     table->verticalHeader()->setMinimumSectionSize(1);
 }
+
+void relaxTableView(QTableView* table)
+{
+    relaxSplitterChild(table);
+    table->horizontalHeader()->setMinimumSectionSize(1);
+    table->verticalHeader()->setMinimumSectionSize(1);
+}
 }
 
 SessionWidget::SessionWidget(QWidget* parent)
@@ -53,7 +67,8 @@ SessionWidget::SessionWidget(QWidget* parent)
     buildUi();
     applyStyle();
 
-    connect(&service_, &UsbCanService::frameReceived, this, &SessionWidget::onFrameReceived);
+    connect(&service_, &UsbCanService::framesReceived, this, &SessionWidget::onFramesReceived);
+    connect(&service_, &UsbCanService::rawFramesReceived, this, &SessionWidget::onRawFramesReceived);
     connect(&service_, &UsbCanService::logEmitted, this, &SessionWidget::onLogEmitted);
 
     refreshDevices();
@@ -67,6 +82,7 @@ SessionWidget::~SessionWidget()
 
 void SessionWidget::shutdown()
 {
+    stopTxQueueLoop();
     stopAllCycleLoops();
     service_.disconnectDevice();
 }
@@ -74,19 +90,22 @@ void SessionWidget::shutdown()
 void SessionWidget::buildUi()
 {
     auto* root = new QVBoxLayout(this);
-    root->setContentsMargins(12, 12, 12, 12);
+    root->setContentsMargins(12, 0, 12, 12);
     root->setSpacing(12);
 
-    auto* verticalSplitter = new QSplitter(Qt::Vertical, this);
-    verticalSplitter->setObjectName("sectionSplitter");
-    verticalSplitter->setChildrenCollapsible(true);
-    verticalSplitter->setOpaqueResize(true);
-    verticalSplitter->setHandleWidth(9);
-    root->addWidget(verticalSplitter, 1);
+    sectionSplitter_ = new QSplitter(Qt::Vertical, this);
+    sectionSplitter_->setObjectName("sectionSplitter");
+    sectionSplitter_->setChildrenCollapsible(true);
+    sectionSplitter_->setOpaqueResize(true);
+    sectionSplitter_->setHandleWidth(5);
+    root->addWidget(sectionSplitter_, 1);
 
     auto* header = new QGroupBox(this);
+    header->setObjectName("headerPanel");
     relaxSplitterChild(header);
-    auto* headerLayout = new QGridLayout(header);
+    auto* headerLayout = new QVBoxLayout(header);
+    headerLayout->setContentsMargins(14, 12, 14, 12);
+    headerLayout->setSpacing(8);
     headerLayout->setSizeConstraint(QLayout::SetNoConstraint);
 
     deviceCombo_ = new QComboBox(header);
@@ -94,83 +113,150 @@ void SessionWidget::buildUi()
     baudCombo_ = new QComboBox(header);
     modeCombo_ = new QComboBox(header);
     filterCombo_ = new QComboBox(header);
+    profileCombo_ = new QComboBox(header);
     connectButton_ = new QPushButton("Connect", header);
     disconnectButton_ = new QPushButton("Disconnect", header);
     auto* refreshButton = new QPushButton("Refresh", header);
     auto* closeButton = new QPushButton("Close Session", header);
+    connectionStatus_ = new QLabel("DISCONNECTED", header);
+    connectionStatus_->setObjectName("connectionStatus");
+    connectionStatus_->setAlignment(Qt::AlignCenter);
+    connectionStatus_->setProperty("state", "inactive");
+    connectButton_->setObjectName("primaryButton");
+    disconnectButton_->setObjectName("warningButton");
+    refreshButton->setObjectName("secondaryButton");
+    closeButton->setObjectName("dangerButton");
+    connectButton_->setProperty("variant", "primary");
+    disconnectButton_->setProperty("tone", "warn");
+    closeButton->setProperty("tone", "danger");
 
     channelCombo_->addItems({"0", "1"});
     baudCombo_->addItems({"1M", "500K", "250K", "125K"});
     baudCombo_->setCurrentText("500K");
-    modeCombo_->addItems({"Normal", "Listen Only"});
-    filterCombo_->addItems({"Accept All", "Single Filter"});
+    modeCombo_->addItem("Normal", "Normal");
+    modeCombo_->addItem("Listen Only", "Listen Only");
+    filterCombo_->addItem("Accept All", "Accept All");
+    filterCombo_->addItem("Single Filter", "Single Filter");
+    profileCombo_->addItems({"Fault Reading", "NMEA 2000"});
+    profileCombo_->setToolTip("Select the adapter operating profile. NMEA 2000 is receive-only.");
 
-    const auto addLabeled = [headerLayout](const QString& label, QWidget* widget, int column) {
+    auto* identityRow = new QHBoxLayout();
+    identityRow->setContentsMargins(0, 0, 0, 0);
+    auto* identityText = new QVBoxLayout();
+    identityText->setContentsMargins(0, 0, 0, 0);
+    identityText->setSpacing(1);
+    auto* familyLabel = new QLabel("ZVRNK TOOL FAMILY / CAN BUS TOOL", header);
+    familyLabel->setObjectName("eyebrowLabel");
+    auto* appLabel = new QLabel("ZVRNK CAN Tool", header);
+    appLabel->setObjectName("titleLabel");
+    auto* subtitleLabel = new QLabel("Configure, transmit, and inspect live CAN traffic.", header);
+    subtitleLabel->setObjectName("subtitleLabel");
+    identityText->addWidget(familyLabel);
+    identityText->addWidget(appLabel);
+    identityText->addWidget(subtitleLabel);
+    identityRow->addLayout(identityText, 1);
+    identityRow->addWidget(connectionStatus_, 0, Qt::AlignVCenter);
+    headerLayout->addLayout(identityRow);
+
+    auto* connectionGrid = new QGridLayout();
+    connectionGrid->setContentsMargins(0, 0, 0, 0);
+    connectionGrid->setHorizontalSpacing(8);
+    connectionGrid->setVerticalSpacing(5);
+    const auto addLabeled = [connectionGrid](const QString& label, QWidget* widget, int column) {
         auto* text = new QLabel(label);
-        headerLayout->addWidget(text, 0, column);
-        headerLayout->addWidget(widget, 1, column);
+        connectionGrid->addWidget(text, 0, column);
+        connectionGrid->addWidget(widget, 1, column);
     };
-    addLabeled("Device", deviceCombo_, 0);
-    addLabeled("Channel", channelCombo_, 1);
-    addLabeled("Baud", baudCombo_, 2);
-    addLabeled("Mode", modeCombo_, 3);
-    addLabeled("Filter", filterCombo_, 4);
-    headerLayout->addWidget(refreshButton, 1, 5);
-    headerLayout->addWidget(connectButton_, 1, 6);
-    headerLayout->addWidget(disconnectButton_, 1, 7);
-    headerLayout->addWidget(closeButton, 1, 8);
-    headerLayout->setColumnStretch(0, 1);
-    verticalSplitter->addWidget(header);
+    addLabeled("Profile", profileCombo_, 0);
+    addLabeled("Device", deviceCombo_, 1);
+    addLabeled("Channel", channelCombo_, 2);
+    addLabeled("Baud", baudCombo_, 3);
+    addLabeled("Mode", modeCombo_, 4);
+    addLabeled("Filter", filterCombo_, 5);
+    connectionGrid->addWidget(refreshButton, 2, 0);
+    connectionGrid->addWidget(connectButton_, 2, 1);
+    connectionGrid->addWidget(disconnectButton_, 2, 2);
+    connectionGrid->addWidget(closeButton, 2, 3);
+    for (int column = 0; column < 6; ++column) {
+        connectionGrid->setColumnStretch(column, 1);
+    }
+    headerLayout->addLayout(connectionGrid);
+    sectionSplitter_->addWidget(header);
 
     connect(refreshButton, &QPushButton::clicked, this, &SessionWidget::refreshDevices);
     connect(connectButton_, &QPushButton::clicked, this, &SessionWidget::connectDevice);
     connect(disconnectButton_, &QPushButton::clicked, this, &SessionWidget::disconnectDevice);
     connect(closeButton, &QPushButton::clicked, this, &SessionWidget::closeRequested);
+    connect(profileCombo_, qOverload<int>(&QComboBox::currentIndexChanged), this, &SessionWidget::setOperatingMode);
 
-    auto* middleSplitter = new QSplitter(Qt::Horizontal, this);
-    middleSplitter->setObjectName("panelSplitter");
-    middleSplitter->setChildrenCollapsible(true);
-    middleSplitter->setOpaqueResize(true);
-    middleSplitter->setHandleWidth(9);
-    verticalSplitter->addWidget(middleSplitter);
+    middleSplitter_ = new QSplitter(Qt::Horizontal, this);
+    middleSplitter_->setObjectName("panelSplitter");
+    middleSplitter_->setChildrenCollapsible(true);
+    middleSplitter_->setOpaqueResize(true);
+    middleSplitter_->setHandleWidth(5);
+    sectionSplitter_->addWidget(middleSplitter_);
 
-    auto* txBox = new QGroupBox("Transmit", this);
-    relaxSplitterChild(txBox);
-    auto* txLayout = new QVBoxLayout(txBox);
+    txBox_ = new QGroupBox("Transmit", this);
+    relaxSplitterChild(txBox_);
+    auto* txLayout = new QVBoxLayout(txBox_);
     txLayout->setSizeConstraint(QLayout::SetNoConstraint);
-    auto* txActions = new QHBoxLayout();
-    auto* addButton = new QPushButton("Add", txBox);
-    auto* removeButton = new QPushButton("Remove", txBox);
-    auto* exportTxButton = new QPushButton("Export CSV", txBox);
-    auto* importTxButton = new QPushButton("Import CSV", txBox);
-    defaultExtCheck_ = new QCheckBox("Extended Frame", txBox);
-    defaultRtrCheck_ = new QCheckBox("Remote Frame", txBox);
+    auto* txActions = new QGridLayout();
+    auto* addButton = new QPushButton("Add", txBox_);
+    auto* removeButton = new QPushButton("Remove", txBox_);
+    txQueueButton_ = new QPushButton("Loop Queue", txBox_);
+    auto* exportTxButton = new QPushButton("Export CSV", txBox_);
+    auto* importTxButton = new QPushButton("Import CSV", txBox_);
+    addButton->setObjectName("primaryButton");
+    removeButton->setObjectName("dangerButton");
+    txQueueButton_->setObjectName("toggleButton");
+    txQueueButton_->setCheckable(true);
+    txQueueButton_->setToolTip("Send one transmit row every 200 ms, looping from first to last");
+    exportTxButton->setObjectName("secondaryButton");
+    importTxButton->setObjectName("secondaryButton");
+    addButton->setProperty("variant", "primary");
+    removeButton->setProperty("tone", "danger");
+    defaultExtCheck_ = new QCheckBox("Extended Frame", txBox_);
+    defaultRtrCheck_ = new QCheckBox("Remote Frame", txBox_);
     defaultExtCheck_->setChecked(true);
-    txActions->addWidget(defaultExtCheck_);
-    txActions->addWidget(defaultRtrCheck_);
-    txActions->addStretch();
-    txActions->addWidget(addButton);
-    txActions->addWidget(removeButton);
-    txActions->addWidget(exportTxButton);
-    txActions->addWidget(importTxButton);
+    txActions->addWidget(defaultExtCheck_, 0, 0);
+    txActions->addWidget(defaultRtrCheck_, 0, 1);
+    txActions->addWidget(addButton, 0, 2);
+    txActions->addWidget(removeButton, 0, 3);
+    txActions->addWidget(txQueueButton_, 1, 0);
+    txActions->addWidget(exportTxButton, 1, 1);
+    txActions->addWidget(importTxButton, 1, 2);
+    txActions->setColumnStretch(4, 1);
     txLayout->addLayout(txActions);
 
-    txTable_ = new QTableWidget(0, TxColumnCount, txBox);
+    txTable_ = new QTableWidget(0, TxColumnCount, txBox_);
     relaxTable(txTable_);
-    txTable_->setHorizontalHeaderLabels({"M/C", "Name", "Ext", "RTR", "Interval(ms)", "ID", "Data"});
+    txTable_->setHorizontalHeaderLabels({"Actions", "Name", "Ext", "RTR", "Interval(ms)", "ID", "Data"});
+    txTable_->horizontalHeader()->setSectionResizeMode(TxActionColumn, QHeaderView::ResizeToContents);
     txTable_->horizontalHeader()->setSectionResizeMode(TxDataColumn, QHeaderView::Stretch);
     txTable_->verticalHeader()->setVisible(false);
+    txTable_->verticalHeader()->setSectionResizeMode(QHeaderView::Fixed);
+    txTable_->verticalHeader()->setDefaultSectionSize(34);
     txTable_->setSelectionBehavior(QAbstractItemView::SelectRows);
     txTable_->setSelectionMode(QAbstractItemView::SingleSelection);
+    txTable_->setHorizontalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+    txTable_->setFont(QFontDatabase::systemFont(QFontDatabase::FixedFont));
     txLayout->addWidget(txTable_, 1);
-    middleSplitter->addWidget(txBox);
+    middleSplitter_->addWidget(txBox_);
 
     connect(addButton, &QPushButton::clicked, this, &SessionWidget::addTxFrame);
     connect(removeButton, &QPushButton::clicked, this, &SessionWidget::removeTxFrame);
+    connect(txQueueButton_, &QPushButton::toggled, this, [this](bool checked) {
+        if (checked) {
+            startTxQueueLoop();
+        } else {
+            stopTxQueueLoop();
+        }
+    });
     connect(exportTxButton, &QPushButton::clicked, this, &SessionWidget::exportTxCsv);
     connect(importTxButton, &QPushButton::clicked, this, &SessionWidget::importTxCsv);
 
     auto* rxBox = new QGroupBox("Received Frames", this);
+    rxBox->setObjectName("receivedFramesPanel");
     relaxSplitterChild(rxBox);
     auto* rxLayout = new QVBoxLayout(rxBox);
     rxLayout->setSizeConstraint(QLayout::SetNoConstraint);
@@ -179,30 +265,42 @@ void SessionWidget::buildUi()
     auto* watchButton = new QPushButton("Watch", rxBox);
     watchButton->setCheckable(true);
     auto* clearRxButton = new QPushButton("Clear List", rxBox);
+    exportRxButton->setObjectName("secondaryButton");
+    watchButton->setObjectName("toggleButton");
+    clearRxButton->setObjectName("dangerButton");
+    clearRxButton->setProperty("tone", "danger");
     rxTop->addStretch();
     rxTop->addWidget(exportRxButton);
     rxTop->addWidget(watchButton);
     rxTop->addWidget(clearRxButton);
     rxLayout->addLayout(rxTop);
 
-    auto* filters = new QHBoxLayout();
+    auto* filters = new QGridLayout();
     rxFilterId_ = new QLineEdit(rxBox);
     rxFilterType_ = new QComboBox(rxBox);
     rxFilterPayload_ = new QLineEdit(rxBox);
     groupFramesCheck_ = new QCheckBox("Group Unique", rxBox);
+    groupFramesCheck_->setChecked(true);
     auto* resetFilterButton = new QPushButton("Reset", rxBox);
-    rxFilterType_->addItems({"ALL", "STD", "EXT", "RTR"});
+    resetFilterButton->setObjectName("secondaryButton");
+    rxFilterType_->addItem("ALL", "ALL");
+    rxFilterType_->addItem("STD", "STD");
+    rxFilterType_->addItem("EXT", "EXT");
+    rxFilterType_->addItem("RTR", "RTR");
     rxFilterId_->setPlaceholderText("Filter ID");
     rxFilterPayload_->setPlaceholderText("Payload Contains");
-    filters->addWidget(rxFilterId_);
-    filters->addWidget(rxFilterType_);
-    filters->addWidget(rxFilterPayload_);
-    filters->addWidget(groupFramesCheck_);
-    filters->addWidget(resetFilterButton);
+    filters->addWidget(rxFilterId_, 0, 0);
+    filters->addWidget(rxFilterType_, 0, 1);
+    filters->addWidget(rxFilterPayload_, 0, 2);
+    filters->addWidget(groupFramesCheck_, 1, 0, 1, 2);
+    filters->addWidget(resetFilterButton, 1, 2);
+    filters->setColumnStretch(0, 2);
+    filters->setColumnStretch(1, 1);
+    filters->setColumnStretch(2, 3);
     rxLayout->addLayout(filters);
 
     watchPanel_ = new QWidget(rxBox);
-    relaxSplitterChild(watchPanel_);
+    watchPanel_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
     auto* watchLayout = new QGridLayout(watchPanel_);
     watchLayout->setSizeConstraint(QLayout::SetNoConstraint);
     watchId_ = new QLineEdit("0x18FF0080", watchPanel_);
@@ -214,45 +312,71 @@ void SessionWidget::buildUi()
     watchRawValue_ = new QLabel("-", watchPanel_);
     watchComputedValue_ = new QLabel("-", watchPanel_);
     watchLength_->addItems({"1", "2", "3", "4"});
-    watchEndian_->addItems({"Little", "Big"});
+    watchEndian_->addItem("Little", "Little");
+    watchEndian_->addItem("Big", "Big");
     watchLayout->addWidget(new QLabel("Watch ID"), 0, 0);
     watchLayout->addWidget(new QLabel("Start Byte"), 0, 1);
     watchLayout->addWidget(new QLabel("Length"), 0, 2);
     watchLayout->addWidget(new QLabel("Endian"), 0, 3);
-    watchLayout->addWidget(new QLabel("Formula (x = dec)"), 0, 5);
     watchLayout->addWidget(watchId_, 1, 0);
     watchLayout->addWidget(watchStartByte_, 1, 1);
     watchLayout->addWidget(watchLength_, 1, 2);
     watchLayout->addWidget(watchEndian_, 1, 3);
-    watchLayout->addWidget(watchSigned_, 1, 4);
-    watchLayout->addWidget(watchFormula_, 1, 5);
-    watchLayout->addWidget(new QLabel("Raw Value (dec)"), 0, 6);
-    watchLayout->addWidget(watchRawValue_, 1, 6);
-    watchLayout->addWidget(new QLabel("Computed Value"), 0, 7);
-    watchLayout->addWidget(watchComputedValue_, 1, 7);
+    watchLayout->addWidget(new QLabel("Formula (x = dec)"), 2, 0);
+    watchLayout->addWidget(watchSigned_, 2, 1);
+    watchLayout->addWidget(new QLabel("Raw Value (dec)"), 2, 2);
+    watchLayout->addWidget(new QLabel("Computed Value"), 2, 3);
+    watchLayout->addWidget(watchFormula_, 3, 0, 1, 2);
+    watchLayout->addWidget(watchRawValue_, 3, 2);
+    watchLayout->addWidget(watchComputedValue_, 3, 3);
+    watchLayout->setColumnStretch(0, 2);
+    watchLayout->setColumnStretch(1, 2);
+    watchLayout->setColumnStretch(2, 1);
+    watchLayout->setColumnStretch(3, 1);
+    watchPanel_->setMinimumHeight(116);
     watchPanel_->setVisible(false);
     rxLayout->addWidget(watchPanel_);
 
-    rxTable_ = new QTableWidget(0, 7, rxBox);
-    relaxTable(rxTable_);
-    rxTable_->setHorizontalHeaderLabels({"Time", "Seen", "Channel", "ID", "Type", "Len", "Data"});
-    rxTable_->horizontalHeader()->setSectionResizeMode(6, QHeaderView::Stretch);
+    rxModel_ = new RxFrameTableModel(this);
+    rxTable_ = new QTableView(rxBox);
+    relaxTableView(rxTable_);
+    rxTable_->setModel(rxModel_);
+    rxTable_->horizontalHeader()->setSectionResizeMode(7, QHeaderView::Stretch);
     rxTable_->verticalHeader()->setVisible(false);
     rxTable_->setEditTriggers(QAbstractItemView::NoEditTriggers);
     rxTable_->setSelectionBehavior(QAbstractItemView::SelectRows);
+    rxTable_->setSelectionMode(QAbstractItemView::SingleSelection);
+    rxTable_->setAlternatingRowColors(true);
+    rxTable_->setWordWrap(false);
+    rxTable_->setShowGrid(false);
+    rxTable_->setHorizontalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+    rxTable_->setFont(QFontDatabase::systemFont(QFontDatabase::FixedFont));
+    rxTable_->verticalHeader()->setSectionResizeMode(QHeaderView::Fixed);
+    rxTable_->verticalHeader()->setDefaultSectionSize(24);
     rxLayout->addWidget(rxTable_, 1);
-    middleSplitter->addWidget(rxBox);
-    middleSplitter->setStretchFactor(0, 4);
-    middleSplitter->setStretchFactor(1, 6);
+    middleSplitter_->addWidget(rxBox);
+    middleSplitter_->setStretchFactor(0, 4);
+    middleSplitter_->setStretchFactor(1, 6);
 
     connect(exportRxButton, &QPushButton::clicked, this, &SessionWidget::exportRxCsv);
-    connect(watchButton, &QPushButton::toggled, watchPanel_, &QWidget::setVisible);
+    connect(watchButton, &QPushButton::toggled, this, [this](bool visible) {
+        watchPanel_->setVisible(visible);
+        if (visible) {
+            refreshWatchValue();
+        }
+    });
     connect(clearRxButton, &QPushButton::clicked, this, &SessionWidget::clearRxFrames);
     connect(resetFilterButton, &QPushButton::clicked, this, &SessionWidget::clearRxFilters);
     connect(rxFilterId_, &QLineEdit::textChanged, this, &SessionWidget::refreshRxTable);
     connect(rxFilterPayload_, &QLineEdit::textChanged, this, &SessionWidget::refreshRxTable);
     connect(rxFilterType_, &QComboBox::currentTextChanged, this, &SessionWidget::refreshRxTable);
     connect(groupFramesCheck_, &QCheckBox::toggled, this, &SessionWidget::refreshRxTable);
+    connect(watchId_, &QLineEdit::textChanged, this, &SessionWidget::refreshWatchValue);
+    connect(watchStartByte_, &QLineEdit::textChanged, this, &SessionWidget::refreshWatchValue);
+    connect(watchLength_, &QComboBox::currentTextChanged, this, &SessionWidget::refreshWatchValue);
+    connect(watchEndian_, &QComboBox::currentTextChanged, this, &SessionWidget::refreshWatchValue);
+    connect(watchSigned_, &QCheckBox::toggled, this, &SessionWidget::refreshWatchValue);
+    connect(watchFormula_, &QLineEdit::textChanged, this, &SessionWidget::refreshWatchValue);
 
     auto* logBox = new QGroupBox("Event Log", this);
     relaxSplitterChild(logBox);
@@ -261,6 +385,9 @@ void SessionWidget::buildUi()
     auto* logActions = new QHBoxLayout();
     auto* exportLogButton = new QPushButton("Export CSV", logBox);
     auto* clearLogButton = new QPushButton("Clear Log", logBox);
+    exportLogButton->setObjectName("secondaryButton");
+    clearLogButton->setObjectName("dangerButton");
+    clearLogButton->setProperty("tone", "danger");
     logActions->addStretch();
     logActions->addWidget(exportLogButton);
     logActions->addWidget(clearLogButton);
@@ -268,12 +395,18 @@ void SessionWidget::buildUi()
     logText_ = new QTextEdit(logBox);
     relaxSplitterChild(logText_);
     logText_->setReadOnly(true);
+    logText_->setFont(QFontDatabase::systemFont(QFontDatabase::FixedFont));
     logLayout->addWidget(logText_);
-    verticalSplitter->addWidget(logBox);
-    verticalSplitter->setStretchFactor(0, 0);
-    verticalSplitter->setStretchFactor(1, 6);
-    verticalSplitter->setStretchFactor(2, 2);
-    verticalSplitter->setSizes({140, 480, 170});
+    sectionSplitter_->addWidget(logBox);
+    sectionSplitter_->setStretchFactor(0, 0);
+    sectionSplitter_->setStretchFactor(1, 6);
+    sectionSplitter_->setStretchFactor(2, 2);
+
+    txTable_->setAccessibleName("Transmit frame table");
+    rxTable_->setAccessibleName("Received CAN frame table");
+    logText_->setAccessibleName("Event log");
+    captureTranslationKeys();
+    updateAdaptiveLayout();
 
     connect(exportLogButton, &QPushButton::clicked, this, &SessionWidget::exportLogCsv);
     connect(clearLogButton, &QPushButton::clicked, this, &SessionWidget::clearLog);
@@ -281,22 +414,140 @@ void SessionWidget::buildUi()
 
 void SessionWidget::applyStyle()
 {
-    setStyleSheet(R"(
-        QWidget { background: #0E1624; color: #FFFFFF; }
-        QGroupBox { background: #162338; border: 1px solid #2E4568; border-radius: 8px; margin-top: 12px; padding: 12px; font-weight: 600; }
-        QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 4px; color: #FFFFFF; }
-        QLineEdit, QComboBox, QTextEdit, QTableWidget { background: #0E1624; border: 1px solid #2E4568; color: #FFFFFF; selection-background-color: #2B4A74; }
-        QPushButton, QToolButton { background: #26374F; border: 0; border-radius: 5px; color: #FFFFFF; padding: 7px 10px; }
-        QPushButton:hover, QToolButton:hover { background: #466690; }
-        QPushButton:checked, QToolButton:checked { background: #FF8A3D; }
-        QHeaderView::section { background: #203457; color: #FFFFFF; border: 0; padding: 6px; }
-        QTableWidget { gridline-color: #2E4568; alternate-background-color: #0F1A2D; }
-        QCheckBox { spacing: 6px; }
-        QSplitter::handle { background: #0E1624; border: 1px solid #243A5B; border-radius: 4px; }
-        QSplitter::handle:hover { border-color: #6FA8FF; }
-        QSplitter::handle:horizontal { margin: 2px 1px; }
-        QSplitter::handle:vertical { margin: 1px 2px; }
-    )");
+    // The application-level theme is owned by MainWindow so all sessions stay consistent.
+}
+
+void SessionWidget::setLanguage(AppLanguage language)
+{
+    language_ = language;
+    captureTranslationKeys();
+    retranslateUi();
+    updateConnectionState();
+    updateOperatingModeUi();
+    updateTxQueueButton();
+}
+
+void SessionWidget::captureTranslationKeys()
+{
+    const auto captureWidget = [](QWidget* widget, const QString& text) {
+        if (widget == nullptr || text.isEmpty() || widget->property("dynamicText").toBool()) {
+            return;
+        }
+        if (!widget->property("i18nSource").isValid()) {
+            widget->setProperty("i18nSource", text);
+        }
+    };
+
+    for (QLabel* label : findChildren<QLabel*>()) {
+        captureWidget(label, label->text());
+    }
+    for (QAbstractButton* button : findChildren<QAbstractButton*>()) {
+        captureWidget(button, button->text());
+    }
+    for (QGroupBox* groupBox : findChildren<QGroupBox*>()) {
+        captureWidget(groupBox, groupBox->title());
+    }
+    for (QComboBox* combo : findChildren<QComboBox*>()) {
+        if (!combo->property("i18nItems").isValid() && combo->count() > 0) {
+            QStringList items;
+            for (int index = 0; index < combo->count(); ++index) {
+                items.push_back(combo->itemText(index));
+            }
+            combo->setProperty("i18nItems", items);
+        }
+    }
+    for (QLineEdit* edit : findChildren<QLineEdit*>()) {
+        if (!edit->property("i18nPlaceholder").isValid() && !edit->placeholderText().isEmpty()) {
+            edit->setProperty("i18nPlaceholder", edit->placeholderText());
+        }
+    }
+    for (QWidget* widget : findChildren<QWidget*>()) {
+        if (!widget->toolTip().isEmpty() && !widget->property("i18nToolTip").isValid()) {
+            widget->setProperty("i18nToolTip", widget->toolTip());
+        }
+        if (!widget->accessibleName().isEmpty() && !widget->property("i18nAccessibleName").isValid()) {
+            widget->setProperty("i18nAccessibleName", widget->accessibleName());
+        }
+    }
+}
+
+void SessionWidget::retranslateUi()
+{
+    const auto translated = [this](const QString& source) {
+        return localize(language_, source);
+    };
+
+    for (QLabel* label : findChildren<QLabel*>()) {
+        const QVariant source = label->property("i18nSource");
+        if (source.isValid()) {
+            label->setText(translated(source.toString()));
+        }
+    }
+    for (QAbstractButton* button : findChildren<QAbstractButton*>()) {
+        const QVariant source = button->property("i18nSource");
+        if (source.isValid()) {
+            button->setText(translated(source.toString()));
+        }
+    }
+    for (QToolButton* button : findChildren<QToolButton*>()) {
+        if (button->property("cycleControl").toBool()) {
+            button->setText(translated(button->isChecked() ? "Stop" : "Cycle"));
+        }
+    }
+    for (QGroupBox* groupBox : findChildren<QGroupBox*>()) {
+        const QVariant source = groupBox->property("i18nSource");
+        if (source.isValid()) {
+            groupBox->setTitle(translated(source.toString()));
+        }
+    }
+    for (QComboBox* combo : findChildren<QComboBox*>()) {
+        const QStringList sources = combo->property("i18nItems").toStringList();
+        for (int index = 0; index < std::min(combo->count(), static_cast<int>(sources.size())); ++index) {
+            combo->setItemText(index, translated(sources[index]));
+        }
+    }
+    for (QLineEdit* edit : findChildren<QLineEdit*>()) {
+        const QVariant source = edit->property("i18nPlaceholder");
+        if (source.isValid()) {
+            edit->setPlaceholderText(translated(source.toString()));
+        }
+    }
+    for (QWidget* widget : findChildren<QWidget*>()) {
+        const QVariant toolTip = widget->property("i18nToolTip");
+        if (toolTip.isValid()) {
+            widget->setToolTip(translated(toolTip.toString()));
+        }
+        const QVariant accessibleName = widget->property("i18nAccessibleName");
+        if (accessibleName.isValid()) {
+            widget->setAccessibleName(translated(accessibleName.toString()));
+        }
+    }
+    rxModel_->setLanguage(language_);
+}
+
+void SessionWidget::updateAdaptiveLayout()
+{
+    if (!middleSplitter_) {
+        return;
+    }
+
+    const bool compact = width() < 1040;
+    const Qt::Orientation wanted = compact ? Qt::Vertical : Qt::Horizontal;
+    if (middleSplitter_->orientation() != wanted) {
+        middleSplitter_->setOrientation(wanted);
+    }
+
+    if (auto* root = qobject_cast<QVBoxLayout*>(layout())) {
+        const int margin = compact ? 8 : 12;
+        root->setContentsMargins(margin, 0, margin, margin);
+        root->setSpacing(compact ? 8 : 12);
+    }
+}
+
+void SessionWidget::resizeEvent(QResizeEvent* event)
+{
+    QWidget::resizeEvent(event);
+    updateAdaptiveLayout();
 }
 
 void SessionWidget::refreshDevices()
@@ -322,10 +573,11 @@ void SessionWidget::connectDevice()
         }
         const quint32 deviceIndex = deviceCombo_->currentData().toUInt();
         const quint32 channelIndex = channelCombo_->currentText().toUInt();
-        const QString baudRate = baudCombo_->currentText();
-        const bool listenOnly = modeCombo_->currentText() == "Listen Only";
-        const bool singleFilter = filterCombo_->currentText() == "Single Filter";
+        const QString baudRate = nmeaMode_ ? QStringLiteral("250K") : baudCombo_->currentText();
+        const bool listenOnly = nmeaMode_ || modeCombo_->currentData().toString() == "Listen Only";
+        const bool singleFilter = !nmeaMode_ && filterCombo_->currentData().toString() == "Single Filter";
 
+        service_.setNmeaMonitorMode(nmeaMode_);
         service_.connectDevice(deviceIndex, channelIndex, baudRate, listenOnly, singleFilter);
         emit headerChanged(QString("Dev %1 / CH %2").arg(deviceIndex).arg(channelIndex));
         updateConnectionState();
@@ -335,9 +587,88 @@ void SessionWidget::connectDevice()
     }
 }
 
+void SessionWidget::setOperatingMode(int index)
+{
+    const bool requestedNmeaMode = index == 1;
+    if (requestedNmeaMode == nmeaMode_) {
+        updateOperatingModeUi();
+        return;
+    }
+
+    const bool wasConnected = service_.isConnected();
+    if (requestedNmeaMode) {
+        AdapterConfig config;
+        config.deviceIndex = deviceCombo_->currentData().toUInt();
+        config.channelIndex = channelCombo_->currentText().toUInt();
+        config.baudRate = baudCombo_->currentText();
+        config.listenOnly = modeCombo_->currentData().toString() == "Listen Only";
+        config.singleFilter = filterCombo_->currentData().toString() == "Single Filter";
+        savedFaultConfig_ = config;
+
+        if (wasConnected) {
+            service_.disconnectDevice();
+            emit headerChanged("Disconnected");
+        }
+
+        nmeaMode_ = true;
+        nmeaDecoder_.reset();
+        nmeaFrames_.clear();
+        pendingRxFrames_.clear();
+        stopTxQueueLoop();
+        stopAllCycleLoops();
+        {
+            const QSignalBlocker baudBlocker(baudCombo_);
+            const QSignalBlocker modeBlocker(modeCombo_);
+            const QSignalBlocker filterBlocker(filterCombo_);
+            baudCombo_->setCurrentText("250K");
+            modeCombo_->setCurrentIndex(modeCombo_->findData("Listen Only"));
+            filterCombo_->setCurrentIndex(filterCombo_->findData("Accept All"));
+        }
+        service_.setNmeaMonitorMode(true);
+    } else {
+        if (wasConnected) {
+            service_.disconnectDevice();
+            emit headerChanged("Disconnected");
+        }
+
+        nmeaMode_ = false;
+        service_.setNmeaMonitorMode(false);
+        nmeaDecoder_.reset();
+        nmeaFrames_.clear();
+        pendingRxFrames_.clear();
+
+        if (savedFaultConfig_) {
+            const AdapterConfig config = *savedFaultConfig_;
+            const int deviceIndex = deviceCombo_->findData(config.deviceIndex);
+            const QSignalBlocker deviceBlocker(deviceCombo_);
+            const QSignalBlocker channelBlocker(channelCombo_);
+            const QSignalBlocker baudBlocker(baudCombo_);
+            const QSignalBlocker modeBlocker(modeCombo_);
+            const QSignalBlocker filterBlocker(filterCombo_);
+            if (deviceIndex >= 0) {
+                deviceCombo_->setCurrentIndex(deviceIndex);
+            }
+            channelCombo_->setCurrentText(QString::number(config.channelIndex));
+            baudCombo_->setCurrentText(config.baudRate);
+            modeCombo_->setCurrentIndex(modeCombo_->findData(config.listenOnly ? "Listen Only" : "Normal"));
+            filterCombo_->setCurrentIndex(filterCombo_->findData(config.singleFilter ? "Single Filter" : "Accept All"));
+        }
+        savedFaultConfig_.reset();
+    }
+
+    updateOperatingModeUi();
+    updateConnectionState();
+    refreshRxTable();
+
+    if (wasConnected) {
+        connectDevice();
+    }
+}
+
 void SessionWidget::disconnectDevice()
 {
     service_.disconnectDevice();
+    stopTxQueueLoop();
     stopAllCycleLoops();
     emit headerChanged("Disconnected");
     updateConnectionState();
@@ -352,6 +683,7 @@ void SessionWidget::addTxFrame()
     frame.remoteFrame = defaultRtrCheck_->isChecked();
     frame.idText = frame.extendedFrame ? "0x00000000" : "0x000";
     addTxRow(frame);
+    updateTxQueueButton();
 }
 
 void SessionWidget::removeTxFrame()
@@ -364,13 +696,18 @@ void SessionWidget::removeTxFrame()
         stopCycleLoop(button);
     }
     txTable_->removeRow(row);
+    updateTxQueueButton();
 }
 
 void SessionWidget::clearRxFrames()
 {
     allFrames_.clear();
     groupedFrames_.clear();
+    nmeaFrames_.clear();
+    pendingRxFrames_.clear();
     groupedIndex_.clear();
+    rxStats_.clear();
+    nmeaDecoder_.reset();
     refreshRxTable();
 }
 
@@ -383,13 +720,13 @@ void SessionWidget::clearRxFilters()
 {
     rxFilterId_->clear();
     rxFilterPayload_->clear();
-    rxFilterType_->setCurrentText("ALL");
+    rxFilterType_->setCurrentIndex(rxFilterType_->findData("ALL"));
     refreshRxTable();
 }
 
 void SessionWidget::exportTxCsv()
 {
-    const QString path = QFileDialog::getSaveFileName(this, "Export Transmit Frames", "tx_frames.csv", "CSV files (*.csv);;All files (*.*)");
+    const QString path = QFileDialog::getSaveFileName(this, "Export Transmit Frames", canToolDocumentsPath("tx_frames.csv"), "CSV files (*.csv);;All files (*.*)");
     if (path.isEmpty()) {
         return;
     }
@@ -423,7 +760,7 @@ void SessionWidget::exportTxCsv()
 
 void SessionWidget::importTxCsv()
 {
-    const QString path = QFileDialog::getOpenFileName(this, "Import Transmit Frames", QString(), "CSV files (*.csv);;All files (*.*)");
+    const QString path = QFileDialog::getOpenFileName(this, "Import Transmit Frames", canToolDocumentsPath(), "CSV files (*.csv);;All files (*.*)");
     if (path.isEmpty()) {
         return;
     }
@@ -463,7 +800,7 @@ void SessionWidget::importTxCsv()
             frame.payloadText = UsbCanService::formatBytes(payload);
 
             addTxRow(frame);
-            if (frame.cycleEnabled && service_.isConnected()) {
+            if (frame.cycleEnabled && service_.isConnected() && !nmeaMode_) {
                 startCycleLoop(cycleButtonAt(txTable_->rowCount() - 1));
             }
             ++imported;
@@ -476,7 +813,7 @@ void SessionWidget::importTxCsv()
 
 void SessionWidget::exportRxCsv()
 {
-    const QString path = QFileDialog::getSaveFileName(this, "Export Receive Frames", "rx_frames.csv", "CSV files (*.csv);;All files (*.*)");
+    const QString path = QFileDialog::getSaveFileName(this, "Export Receive Frames", canToolDocumentsPath("rx_frames.csv"), "CSV files (*.csv);;All files (*.*)");
     if (path.isEmpty()) {
         return;
     }
@@ -488,24 +825,27 @@ void SessionWidget::exportRxCsv()
     }
 
     QTextStream out(&file);
-    out << "Timestamp,Channel,ID,Type,Length,Data\n";
+    out << "Realtime,Seen,FrequencyHz,Channel,ID,Type,Length,Data\n";
     for (const CanFrame& frame : activeRxFrames()) {
         if (!frameMatchesFilters(frame)) {
             continue;
         }
-        out << csv(frame.timestamp) << ','
-            << csv(frame.channel) << ','
-            << csv(frame.idText) << ','
-            << csv(frame.frameType) << ','
-            << frame.length << ','
-            << csv(frame.dataText) << '\n';
+        const CanFrame displayFrame = frameWithCurrentRxStats(frame);
+        out << csv(displayFrame.timestamp) << ','
+            << displayFrame.seenCount << ','
+            << QString::number(displayFrame.receiveFrequencyHz, 'f', 2) << ','
+            << csv(displayFrame.channel) << ','
+            << csv(displayFrame.idText) << ','
+            << csv(displayFrame.frameType) << ','
+            << displayFrame.length << ','
+            << csv(displayFrame.dataText) << '\n';
     }
     appendLog(QString("RX CSV exported: %1").arg(path));
 }
 
 void SessionWidget::exportLogCsv()
 {
-    const QString path = QFileDialog::getSaveFileName(this, "Export Event Log", "event_log.csv", "CSV files (*.csv);;All files (*.*)");
+    const QString path = QFileDialog::getSaveFileName(this, "Export Event Log", canToolDocumentsPath("event_log.csv"), "CSV files (*.csv);;All files (*.*)");
     if (path.isEmpty()) {
         return;
     }
@@ -528,15 +868,101 @@ void SessionWidget::exportLogCsv()
     appendLog(QString("Log CSV exported: %1").arg(path));
 }
 
-void SessionWidget::onFrameReceived(const CanFrame& frame)
+void SessionWidget::onFramesReceived(const QVector<CanFrame>& frames)
 {
-    allFrames_.prepend(frame);
-    while (allFrames_.size() > 500) {
-        allFrames_.removeLast();
+    if (nmeaMode_ || frames.isEmpty()) {
+        return;
     }
-    upsertGroupedFrame(frame);
+
+    pendingRxFrames_ += frames;
+    scheduleRxFlush(RxFlushIntervalMs);
+}
+
+void SessionWidget::onRawFramesReceived(const QVector<CanFrame>& frames)
+{
+    if (!nmeaMode_ || frames.isEmpty()) {
+        return;
+    }
+
+    QVector<CanFrame> decodedFrames;
+    decodedFrames.reserve(frames.size());
+    for (const CanFrame& frame : frames) {
+        Nmea2000::RawFrame raw;
+        raw.timestampMs = frame.lastSeenMs;
+        raw.timestamp = frame.timestamp;
+        raw.canId = frame.rawId;
+        raw.extended = frame.frameType == "EXT";
+        raw.data = frame.dataBytes;
+
+        const Nmea2000::Info info = nmeaDecoder_.process(raw);
+        if (!info.valid) {
+            continue;
+        }
+
+        CanFrame decoded = frame;
+        decoded.nmeaValid = true;
+        decoded.nmeaPgn = info.pgn;
+        decoded.nmeaPgnText = info.pgnText;
+        decoded.nmeaName = info.pgnName;
+        decoded.nmeaPriority = info.priority;
+        decoded.nmeaSource = info.source;
+        decoded.nmeaDestination = info.destination;
+        decoded.nmeaTransport = info.transport;
+        decoded.nmeaDecoded = info.decoded;
+        decodedFrames.push_back(decoded);
+    }
+
+    for (auto it = decodedFrames.crbegin(); it != decodedFrames.crend(); ++it) {
+        nmeaFrames_.prepend(*it);
+    }
+    if (nmeaFrames_.size() > 500) {
+        nmeaFrames_.remove(500, nmeaFrames_.size() - 500);
+    }
     refreshRxTable();
-    updateWatchValue(frame);
+}
+
+void SessionWidget::flushPendingRxFrames()
+{
+    rxFlushScheduled_ = false;
+    if (pendingRxFrames_.isEmpty()) {
+        return;
+    }
+
+    const int takeCount = qMin(MaxFramesPerRxFlush, pendingRxFrames_.size());
+    QVector<CanFrame> frames;
+    frames.reserve(takeCount);
+    for (int i = 0; i < takeCount; ++i) {
+        frames.push_back(pendingRxFrames_[i]);
+    }
+    pendingRxFrames_.remove(0, takeCount);
+
+    QVector<CanFrame> displayFrames;
+    displayFrames.reserve(qMin(500, frames.size() + allFrames_.size()));
+    for (int i = frames.size() - 1; i >= 0; --i) {
+        const CanFrame& frame = frames[i];
+        const CanFrame enrichedFrame = applyRxStats(frame);
+        if (displayFrames.size() < 500) {
+            displayFrames.push_back(enrichedFrame);
+        }
+        upsertGroupedFrame(enrichedFrame);
+    }
+
+    for (const CanFrame& frame : allFrames_) {
+        if (displayFrames.size() >= 500) {
+            break;
+        }
+        displayFrames.push_back(frame);
+    }
+    allFrames_.swap(displayFrames);
+
+    refreshRxTable();
+    if (watchPanel_->isVisible()) {
+        refreshWatchValue();
+    }
+
+    if (!pendingRxFrames_.isEmpty()) {
+        scheduleRxFlush(RxCatchUpFlushDelayMs);
+    }
 }
 
 void SessionWidget::onLogEmitted(const QString& message)
@@ -549,6 +975,37 @@ void SessionWidget::updateConnectionState()
     const bool connected = service_.isConnected();
     connectButton_->setEnabled(!connected);
     disconnectButton_->setEnabled(connected);
+    const QString connectionText = connected ? (nmeaMode_ ? "NMEA / LISTEN ONLY" : "CONNECTED") : "DISCONNECTED";
+    connectionStatus_->setText(localize(language_, connectionText));
+    connectionStatus_->setProperty("state", connected ? "success" : "inactive");
+    connectionStatus_->style()->unpolish(connectionStatus_);
+    connectionStatus_->style()->polish(connectionStatus_);
+    connectionStatus_->update();
+    updateOperatingModeUi();
+    updateTxQueueButton();
+}
+
+void SessionWidget::updateOperatingModeUi()
+{
+    if (!profileCombo_) {
+        return;
+    }
+
+    const bool connected = service_.isConnected();
+    const bool nmea = nmeaMode_;
+    baudCombo_->setEnabled(!nmea);
+    modeCombo_->setEnabled(!nmea);
+    filterCombo_->setEnabled(!nmea);
+    groupFramesCheck_->setEnabled(!nmea);
+    txBox_->setEnabled(!nmea);
+    txBox_->setTitle(localize(language_, nmea ? "Transmit (disabled in NMEA 2000)" : "Transmit"));
+    profileCombo_->setToolTip(localize(language_, nmea
+        ? "NMEA 2000 monitor: 250 kbit/s, extended IDs, accept all, listen-only"
+        : "Fault reading profile: use the selected adapter settings"));
+    rxModel_->setNmeaMode(nmea);
+    if (nmea && connected) {
+        connectionStatus_->setProperty("state", "success");
+    }
 }
 
 void SessionWidget::appendLog(const QString& message)
@@ -560,15 +1017,25 @@ void SessionWidget::addTxRow(const TxFrame& frame)
 {
     const int row = txTable_->rowCount();
     txTable_->insertRow(row);
+    txTable_->setRowHeight(row, 34);
 
     auto* actionWidget = new QWidget(txTable_);
+    actionWidget->setMinimumWidth(158);
     auto* actionLayout = new QHBoxLayout(actionWidget);
-    actionLayout->setContentsMargins(2, 2, 2, 2);
+    actionLayout->setContentsMargins(5, 2, 5, 2);
+    actionLayout->setSpacing(6);
     auto* manualButton = new QToolButton(actionWidget);
     auto* cycleButton = new QToolButton(actionWidget);
+    manualButton->setObjectName("manualButton");
     cycleButton->setObjectName("cycleButton");
-    manualButton->setText("M");
-    cycleButton->setText("C");
+    manualButton->setProperty("i18nSource", "Send");
+    cycleButton->setProperty("cycleControl", true);
+    manualButton->setText(localize(language_, "Send"));
+    cycleButton->setText(localize(language_, frame.cycleEnabled ? "Stop" : "Cycle"));
+    manualButton->setToolTip("Send this frame once");
+    cycleButton->setToolTip("Toggle cyclic sending for this frame");
+    manualButton->setFixedSize(58, 20);
+    cycleButton->setFixedSize(62, 20);
     cycleButton->setCheckable(true);
     cycleButton->setChecked(frame.cycleEnabled);
     actionLayout->addWidget(manualButton);
@@ -580,8 +1047,13 @@ void SessionWidget::addTxRow(const TxFrame& frame)
     });
     connect(cycleButton, &QToolButton::toggled, this, [this, cycleButton](bool checked) {
         if (checked) {
+            cycleButton->setText(localize(language_, "Stop"));
             startCycleLoop(cycleButton);
+            if (!cycleTimers_.contains(cycleButton)) {
+                cycleButton->setText(localize(language_, "Cycle"));
+            }
         } else {
+            cycleButton->setText(localize(language_, "Cycle"));
             stopCycleLoop(cycleButton);
         }
     });
@@ -601,6 +1073,7 @@ void SessionWidget::addTxRow(const TxFrame& frame)
     txTable_->setItem(row, TxIntervalColumn, interval);
     txTable_->setItem(row, TxIdColumn, id);
     txTable_->setItem(row, TxDataColumn, data);
+    updateTxQueueButton();
 }
 
 TxFrame SessionWidget::readTxRow(int row) const
@@ -648,6 +1121,10 @@ QToolButton* SessionWidget::cycleButtonAt(int row) const
 
 void SessionWidget::manualSendRow(int row)
 {
+    if (nmeaMode_) {
+        appendLog("Manual transmit is disabled in NMEA 2000 monitoring mode.");
+        return;
+    }
     if (!service_.isConnected()) {
         appendLog("Manual send requires an active connection.");
         return;
@@ -661,9 +1138,77 @@ void SessionWidget::manualSendRow(int row)
     }
 }
 
+void SessionWidget::startTxQueueLoop()
+{
+    if (nmeaMode_) {
+        appendLog("Loop Queue is disabled in NMEA 2000 monitoring mode.");
+        updateTxQueueButton();
+        return;
+    }
+    if (!service_.isConnected()) {
+        appendLog("Loop Queue requires an active connection.");
+        updateTxQueueButton();
+        return;
+    }
+    if (txTable_->rowCount() == 0) {
+        appendLog("Loop Queue requires at least one transmit row.");
+        updateTxQueueButton();
+        return;
+    }
+    if (txQueueTimer_) {
+        updateTxQueueButton();
+        return;
+    }
+
+    txQueueRow_ = 0;
+    txQueueTimer_ = new QTimer(this);
+    txQueueTimer_->setInterval(200);
+    connect(txQueueTimer_, &QTimer::timeout, this, &SessionWidget::sendNextTxQueueFrame);
+    txQueueTimer_->start();
+    sendNextTxQueueFrame();
+    updateTxQueueButton();
+}
+
+void SessionWidget::stopTxQueueLoop()
+{
+    if (txQueueTimer_) {
+        txQueueTimer_->stop();
+        txQueueTimer_->deleteLater();
+        txQueueTimer_ = nullptr;
+    }
+    txQueueRow_ = 0;
+    updateTxQueueButton();
+}
+
+void SessionWidget::sendNextTxQueueFrame()
+{
+    if (nmeaMode_ || !service_.isConnected() || txTable_->rowCount() == 0) {
+        stopTxQueueLoop();
+        return;
+    }
+
+    if (txQueueRow_ < 0 || txQueueRow_ >= txTable_->rowCount()) {
+        txQueueRow_ = 0;
+    }
+
+    const int row = txQueueRow_;
+    txQueueRow_ = (txQueueRow_ + 1) % txTable_->rowCount();
+
+    try {
+        const TxFrame frame = readTxRow(row);
+        service_.sendFrame(UsbCanService::parseCanId(frame.idText), UsbCanService::parsePayload(frame.payloadText), frame.extendedFrame, frame.remoteFrame);
+    } catch (const std::exception& ex) {
+        appendLog(QString("Loop Queue send error on row %1: %2").arg(row + 1).arg(ex.what()));
+        stopTxQueueLoop();
+    }
+}
+
 void SessionWidget::startCycleLoop(QToolButton* button)
 {
-    if (!button || !button->isChecked() || !service_.isConnected() || cycleTimers_.contains(button)) {
+    if (nmeaMode_ || !button || !button->isChecked() || !service_.isConnected() || cycleTimers_.contains(button)) {
+        if (nmeaMode_ && button) {
+            button->setChecked(false);
+        }
         return;
     }
 
@@ -681,6 +1226,7 @@ void SessionWidget::startCycleLoop(QToolButton* button)
             timer->setInterval(std::max(10, frame.intervalMs));
         } catch (const std::exception& ex) {
             appendLog(QString("Cycle send error: %1").arg(ex.what()));
+            stopCycleLoop(button);
         }
     });
     timer->start(std::max(10, readTxRow(rowForCycleButton(button)).intervalMs));
@@ -706,14 +1252,26 @@ void SessionWidget::stopAllCycleLoops()
     }
 }
 
+void SessionWidget::updateTxQueueButton()
+{
+    if (!txQueueButton_ || !txTable_) {
+        return;
+    }
+
+    const bool hasRows = txTable_->rowCount() > 0;
+    const bool queueRunning = txQueueTimer_ != nullptr;
+    const QSignalBlocker blocker(txQueueButton_);
+    txQueueButton_->setEnabled(!nmeaMode_ && service_.isConnected() && hasRows);
+    txQueueButton_->setChecked(queueRunning);
+    txQueueButton_->setText(localize(language_, queueRunning ? "Stop Queue" : "Loop Queue"));
+}
+
 void SessionWidget::upsertGroupedFrame(const CanFrame& frame)
 {
     const QString key = groupedKey(frame);
     if (groupedIndex_.contains(key)) {
         CanFrame& existing = groupedFrames_[groupedIndex_[key]];
-        const int seen = existing.seenCount + 1;
         existing = frame;
-        existing.seenCount = seen;
         return;
     }
 
@@ -734,6 +1292,50 @@ QString SessionWidget::groupedKey(const CanFrame& frame) const
     return QString("%1|%2|%3").arg(frame.channel, QString::number(frame.rawId, 16), frame.frameType);
 }
 
+CanFrame SessionWidget::applyRxStats(const CanFrame& frame)
+{
+    const QString key = groupedKey(frame);
+    RxFrameStats& stats = rxStats_[key];
+    const int receivedCount = std::max(1, frame.seenCount);
+    if (stats.seenCount == 0) {
+        stats.firstSeenTimestamp = frame.timestamp;
+        stats.firstSeenMs = frame.lastSeenMs;
+    }
+
+    stats.seenCount += receivedCount;
+    stats.lastSeenTimestamp = frame.timestamp;
+    stats.lastSeenMs = frame.lastSeenMs;
+    stats.receiveFrequencyHz = receiveFrequencyHz(stats.seenCount, stats.firstSeenMs, stats.lastSeenMs);
+
+    CanFrame enrichedFrame = frame;
+    applyRxStatsToFrame(enrichedFrame, stats);
+    return enrichedFrame;
+}
+
+CanFrame SessionWidget::frameWithCurrentRxStats(const CanFrame& frame) const
+{
+    if (nmeaMode_) {
+        return frame;
+    }
+
+    CanFrame displayFrame = frame;
+    const auto stats = rxStats_.constFind(groupedKey(frame));
+    if (stats != rxStats_.cend()) {
+        applyRxStatsToFrame(displayFrame, stats.value());
+    }
+    return displayFrame;
+}
+
+void SessionWidget::applyRxStatsToFrame(CanFrame& frame, const RxFrameStats& stats)
+{
+    frame.firstSeenTimestamp = stats.firstSeenTimestamp;
+    frame.lastSeenTimestamp = stats.lastSeenTimestamp;
+    frame.firstSeenMs = stats.firstSeenMs;
+    frame.lastSeenMs = stats.lastSeenMs;
+    frame.seenCount = stats.seenCount;
+    frame.receiveFrequencyHz = stats.receiveFrequencyHz;
+}
+
 bool SessionWidget::frameMatchesFilters(const CanFrame& frame) const
 {
     const QString idFilter = rxFilterId_->text().trimmed();
@@ -741,7 +1343,7 @@ bool SessionWidget::frameMatchesFilters(const CanFrame& frame) const
         return false;
     }
 
-    const QString type = rxFilterType_->currentText();
+    const QString type = rxFilterType_->currentData().toString();
     if (type != "ALL" && frame.frameType != type) {
         return false;
     }
@@ -756,34 +1358,36 @@ bool SessionWidget::frameMatchesFilters(const CanFrame& frame) const
 
 void SessionWidget::refreshRxTable()
 {
-    rxTable_->setRowCount(0);
+    QVector<CanFrame> rows;
+    rows.reserve(qMin(500, activeRxFrames().size()));
     for (const CanFrame& frame : activeRxFrames()) {
         if (!frameMatchesFilters(frame)) {
             continue;
         }
-        const int row = rxTable_->rowCount();
-        rxTable_->insertRow(row);
-        const QStringList values = {
-            frame.timestamp,
-            QString::number(frame.seenCount),
-            frame.channel,
-            frame.idText,
-            frame.frameType,
-            QString::number(frame.length),
-            frame.dataText
-        };
-        for (int column = 0; column < values.size(); ++column) {
-            rxTable_->setItem(row, column, new QTableWidgetItem(values[column]));
-        }
+        rows.push_back(frameWithCurrentRxStats(frame));
     }
+    rxModel_->setFrames(std::move(rows));
 }
 
-QVector<CanFrame> SessionWidget::activeRxFrames() const
+const QVector<CanFrame>& SessionWidget::activeRxFrames() const
 {
+    if (nmeaMode_) {
+        return nmeaFrames_;
+    }
     return groupFramesCheck_->isChecked() ? groupedFrames_ : allFrames_;
 }
 
-void SessionWidget::updateWatchValue(const CanFrame& frame)
+void SessionWidget::scheduleRxFlush(int delayMs)
+{
+    if (rxFlushScheduled_) {
+        return;
+    }
+
+    rxFlushScheduled_ = true;
+    QTimer::singleShot(delayMs, this, &SessionWidget::flushPendingRxFrames);
+}
+
+bool SessionWidget::updateWatchValue(const CanFrame& frame)
 {
     try {
         quint32 watchId = 0;
@@ -792,15 +1396,17 @@ void SessionWidget::updateWatchValue(const CanFrame& frame)
         bool littleEndian = true;
         bool isSigned = false;
         if (!tryReadWatchConfig(watchId, startByte, length, littleEndian, isSigned)) {
-            return;
+            watchRawValue_->setText("Invalid config");
+            watchComputedValue_->setText("-");
+            return false;
         }
         if (frame.rawId != watchId) {
-            return;
+            return false;
         }
         if (startByte < 0 || length <= 0 || startByte + length > frame.dataBytes.size()) {
             watchRawValue_->setText("Out of range");
             watchComputedValue_->setText("-");
-            return;
+            return true;
         }
 
         QByteArray bytes = frame.dataBytes.mid(startByte, length);
@@ -829,18 +1435,51 @@ void SessionWidget::updateWatchValue(const CanFrame& frame)
             computedText = "0";
         }
         watchComputedValue_->setText(computedText);
+        return true;
     } catch (const std::exception& ex) {
         watchComputedValue_->setText(QString("Err: %1").arg(ex.what()));
+        return true;
     }
+}
+
+void SessionWidget::refreshWatchValue()
+{
+    if (!watchPanel_ || !watchPanel_->isVisible()) {
+        return;
+    }
+
+    quint32 watchId = 0;
+    int startByte = 0;
+    int length = 1;
+    bool littleEndian = true;
+    bool isSigned = false;
+    if (!tryReadWatchConfig(watchId, startByte, length, littleEndian, isSigned)) {
+        watchRawValue_->setText("Invalid config");
+        watchComputedValue_->setText("-");
+        return;
+    }
+
+    for (const CanFrame& frame : allFrames_) {
+        if (updateWatchValue(frame)) {
+            return;
+        }
+    }
+
+    watchRawValue_->setText("-");
+    watchComputedValue_->setText("No match");
 }
 
 bool SessionWidget::tryReadWatchConfig(quint32& watchId, int& startByte, int& length, bool& littleEndian, bool& isSigned) const
 {
     try {
         watchId = UsbCanService::parseCanId(watchId_->text());
-        startByte = watchStartByte_->text().toInt();
+        bool startByteOk = false;
+        startByte = watchStartByte_->text().toInt(&startByteOk);
+        if (!startByteOk) {
+            return false;
+        }
         length = watchLength_->currentText().toInt();
-        littleEndian = watchEndian_->currentText() == "Little";
+        littleEndian = watchEndian_->currentData().toString() == "Little";
         isSigned = watchSigned_->isChecked();
         return true;
     } catch (...) {
@@ -881,4 +1520,35 @@ QStringList SessionWidget::parseCsvLine(const QString& line)
     }
     result << cell;
     return result;
+}
+
+QString SessionWidget::canToolDocumentsPath(const QString& fileName)
+{
+    QString documentsPath = QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation);
+    if (documentsPath.isEmpty()) {
+        documentsPath = QDir::homePath();
+    }
+
+    QDir documentsDir(documentsPath);
+    if (!documentsDir.exists("CanToolDoc")) {
+        documentsDir.mkpath("CanToolDoc");
+    }
+
+    const QString directoryPath = documentsDir.filePath("CanToolDoc");
+    return fileName.isEmpty() ? directoryPath : QDir(directoryPath).filePath(fileName);
+}
+
+double SessionWidget::receiveFrequencyHz(int seenCount, qint64 firstSeenMs, qint64 lastSeenMs)
+{
+    const qint64 elapsedMs = lastSeenMs - firstSeenMs;
+    if (seenCount < 2 || elapsedMs < MinFrequencyElapsedMs) {
+        return 0.0;
+    }
+
+    return (seenCount - 1) / (elapsedMs / 1000.0);
+}
+
+QString SessionWidget::formatFrequency(double hz)
+{
+    return QString::number(hz, 'f', 2);
 }

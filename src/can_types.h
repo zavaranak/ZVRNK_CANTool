@@ -24,6 +24,11 @@ struct CanDeviceInfo
 struct CanFrame
 {
     QString timestamp;
+    QString firstSeenTimestamp;
+    QString lastSeenTimestamp;
+    qint64 firstSeenMs = 0;
+    qint64 lastSeenMs = 0;
+    double receiveFrequencyHz = 0.0;
     QString channel;
     QString idText;
     quint32 rawId = 0;
@@ -32,6 +37,15 @@ struct CanFrame
     QByteArray dataBytes;
     QString dataText;
     int seenCount = 1;
+    bool nmeaValid = false;
+    quint32 nmeaPgn = 0;
+    QString nmeaPgnText;
+    QString nmeaName;
+    int nmeaPriority = -1;
+    int nmeaSource = -1;
+    int nmeaDestination = -1;
+    QString nmeaTransport;
+    QString nmeaDecoded;
 };
 
 struct TxFrame

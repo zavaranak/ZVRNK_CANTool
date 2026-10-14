@@ -55,6 +55,13 @@ public:
         quint8 mode;
     };
 
+    struct VciErrInfo
+    {
+        quint32 errCode;
+        quint8 passiveErrData[3];
+        quint8 arLostErrData;
+    };
+
     static ControlCanNative& instance();
 
     bool ensureLoaded(QString* error = nullptr);
@@ -68,6 +75,7 @@ public:
     quint32 transmit(quint32 deviceType, quint32 deviceIndex, quint32 canIndex, VciCanObj* frames, quint32 length);
     quint32 receive(quint32 deviceType, quint32 deviceIndex, quint32 canIndex, VciCanObj* frames, quint32 length, int waitTimeMs);
     quint32 getReceiveNum(quint32 deviceType, quint32 deviceIndex, quint32 canIndex);
+    bool readErrInfo(quint32 deviceType, quint32 deviceIndex, quint32 canIndex, VciErrInfo* errorInfo);
 
 private:
     using OpenDeviceFn = quint32 (WINAPI*)(quint32, quint32, quint32);
@@ -78,15 +86,18 @@ private:
     using TransmitFn = quint32 (WINAPI*)(quint32, quint32, quint32, VciCanObj*, quint32);
     using ReceiveFn = quint32 (WINAPI*)(quint32, quint32, quint32, VciCanObj*, quint32, int);
     using GetReceiveNumFn = quint32 (WINAPI*)(quint32, quint32, quint32);
+    using ReadErrInfoFn = quint32 (WINAPI*)(quint32, quint32, quint32, VciErrInfo*);
     using FindUsbDevice2Fn = quint32 (WINAPI*)(VciBoardInfo*);
 
     ControlCanNative() = default;
 
     bool resolve(QString* error);
+    bool functionsResolved() const;
+    void clearFunctions();
     static QString cleanFixedString(const char* text, qsizetype maxLength);
 
     QLibrary library_;
-    bool loadAttempted_ = false;
+    QString loadError_;
 
     OpenDeviceFn openDevice_ = nullptr;
     CloseDeviceFn closeDevice_ = nullptr;
@@ -96,5 +107,6 @@ private:
     TransmitFn transmit_ = nullptr;
     ReceiveFn receive_ = nullptr;
     GetReceiveNumFn getReceiveNum_ = nullptr;
+    ReadErrInfoFn readErrInfo_ = nullptr;
     FindUsbDevice2Fn findUsbDevice2_ = nullptr;
 };

@@ -34,6 +34,15 @@ cmake -S . -B build -G "Ninja" `
 
 Adjust the Qt path and DLL path for your installation.
 
+You can also set `CONTROLCAN_DLL_PATH` in the environment before configuring; CMake will use it as the default cache value:
+
+```powershell
+$env:CONTROLCAN_DLL_PATH="D:\path\to\ControlCAN.dll"
+cmake -S . -B build -G "Ninja" `
+  -DCMAKE_BUILD_TYPE=Release `
+  -DCMAKE_PREFIX_PATH="C:\Qt\6.x.x\msvcXXXX_64"
+```
+
 If using Visual Studio generator:
 
 ```powershell
@@ -68,6 +77,8 @@ If the app cannot load `ControlCAN.dll`, either:
 
 - copy `ControlCAN.dll` beside the executable, or
 - set the runtime environment variable `CONTROLCAN_DLL_PATH` to the DLL path.
+
+The event log reports each path the runtime tried. If a full path exists but still reports "The specified module could not be found", the usual cause is a missing vendor dependency DLL next to `ControlCAN.dll` or a bitness mismatch between the app and the DLL.
 
 ## 5. Git Norms
 

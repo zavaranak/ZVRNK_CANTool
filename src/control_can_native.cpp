@@ -3,11 +3,13 @@
 #include <QCoreApplication>
 #include <QDir>
 #include <QProcessEnvironment>
+#include <QSet>
 #include <QStringList>
 
 static_assert(sizeof(ControlCanNative::VciCanObj) == 24);
 static_assert(sizeof(ControlCanNative::VciInitConfig) == 16);
 static_assert(sizeof(ControlCanNative::VciBoardInfo) == 80);
+static_assert(sizeof(ControlCanNative::VciErrInfo) == 8);
 
 ControlCanNative& ControlCanNative::instance()
 {
@@ -17,41 +19,68 @@ ControlCanNative& ControlCanNative::instance()
 
 bool ControlCanNative::ensureLoaded(QString* error)
 {
-    if (findUsbDevice2_) {
+    if (functionsResolved()) {
         return true;
     }
 
-    if (loadAttempted_ && !library_.isLoaded()) {
-        if (error) {
-            *error = library_.errorString();
-        }
-        return false;
-    }
-
-    loadAttempted_ = true;
+    loadError_.clear();
+    clearFunctions();
 
     const auto env = QProcessEnvironment::systemEnvironment();
     const QString configuredPath = env.value("CONTROLCAN_DLL_PATH");
     const QString appDir = QCoreApplication::applicationDirPath();
 
     QStringList candidates;
+    QSet<QString> seenCandidates;
+    const auto addCandidate = [&candidates, &seenCandidates](const QString& path) {
+        if (path.trimmed().isEmpty()) {
+            return;
+        }
+
+        const QString normalized = QDir::isAbsolutePath(path) ? QDir::cleanPath(path) : path;
+        const QString key = normalized.toCaseFolded();
+        if (seenCandidates.contains(key)) {
+            return;
+        }
+
+        seenCandidates.insert(key);
+        candidates << normalized;
+    };
+
     if (!configuredPath.isEmpty()) {
-        candidates << configuredPath;
+        addCandidate(configuredPath);
     }
-    candidates << QDir(appDir).filePath("ControlCAN.dll")
-               << QDir::current().filePath("ControlCAN.dll")
-               << "ControlCAN.dll";
+    addCandidate(QDir(appDir).filePath("ControlCAN.dll"));
+    addCandidate(QDir(appDir).filePath("../ControlCAN.dll"));
+    addCandidate(QDir(appDir).filePath("../../ControlCAN.dll"));
+    addCandidate(QDir::current().filePath("ControlCAN.dll"));
+    addCandidate("ControlCAN.dll");
+
+    QStringList attempts;
 
     for (const QString& candidate : candidates) {
+        clearFunctions();
         library_.setFileName(candidate);
-        if (library_.load() && resolve(error)) {
+        if (!library_.load()) {
+            attempts << QString("%1: %2").arg(candidate, library_.errorString());
+            continue;
+        }
+
+        QString resolveError;
+        if (resolve(&resolveError)) {
+            loadError_.clear();
             return true;
         }
+
+        attempts << QString("%1: %2").arg(candidate, resolveError);
         library_.unload();
+        clearFunctions();
     }
 
+    loadError_ = QString("ControlCAN.dll could not be loaded. Copy it beside the executable or set CONTROLCAN_DLL_PATH. Tried: %1")
+                     .arg(attempts.join("; "));
     if (error) {
-        *error = "ControlCAN.dll could not be loaded. Copy it beside the executable or set CONTROLCAN_DLL_PATH.";
+        *error = loadError_;
     }
     return false;
 }
@@ -125,6 +154,14 @@ quint32 ControlCanNative::getReceiveNum(quint32 deviceType, quint32 deviceIndex,
     return getReceiveNum_(deviceType, deviceIndex, canIndex);
 }
 
+bool ControlCanNative::readErrInfo(quint32 deviceType, quint32 deviceIndex, quint32 canIndex, VciErrInfo* errorInfo)
+{
+    if (!readErrInfo_) {
+        return false;
+    }
+    return readErrInfo_(deviceType, deviceIndex, canIndex, errorInfo) == StatusOk;
+}
+
 bool ControlCanNative::resolve(QString* error)
 {
     openDevice_ = reinterpret_cast<OpenDeviceFn>(library_.resolve("VCI_OpenDevice"));
@@ -135,6 +172,7 @@ bool ControlCanNative::resolve(QString* error)
     transmit_ = reinterpret_cast<TransmitFn>(library_.resolve("VCI_Transmit"));
     receive_ = reinterpret_cast<ReceiveFn>(library_.resolve("VCI_Receive"));
     getReceiveNum_ = reinterpret_cast<GetReceiveNumFn>(library_.resolve("VCI_GetReceiveNum"));
+    readErrInfo_ = reinterpret_cast<ReadErrInfoFn>(library_.resolve("VCI_ReadErrInfo"));
     findUsbDevice2_ = reinterpret_cast<FindUsbDevice2Fn>(library_.resolve("VCI_FindUsbDevice2"));
 
     if (openDevice_ && closeDevice_ && initCan_ && startCan_ && resetCan_ &&
@@ -146,6 +184,26 @@ bool ControlCanNative::resolve(QString* error)
         *error = "ControlCAN.dll loaded, but one or more VCI_* exports were not found.";
     }
     return false;
+}
+
+bool ControlCanNative::functionsResolved() const
+{
+    return openDevice_ && closeDevice_ && initCan_ && startCan_ && resetCan_ &&
+           transmit_ && receive_ && getReceiveNum_ && findUsbDevice2_;
+}
+
+void ControlCanNative::clearFunctions()
+{
+    openDevice_ = nullptr;
+    closeDevice_ = nullptr;
+    initCan_ = nullptr;
+    startCan_ = nullptr;
+    resetCan_ = nullptr;
+    transmit_ = nullptr;
+    receive_ = nullptr;
+    getReceiveNum_ = nullptr;
+    readErrInfo_ = nullptr;
+    findUsbDevice2_ = nullptr;
 }
 
 QString ControlCanNative::cleanFixedString(const char* text, qsizetype maxLength)

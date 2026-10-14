@@ -2,6 +2,15 @@
 
 This directory contains the Qt/C++ rebuild of the original WPF ZVRNK CAN Tool.
 
+## ZVRNK project family
+
+- `ZVRNKPts` — image processing and compositing.
+- `ZVRNK_CANTool` — live USB-CAN communication and CSV export.
+- `ZVRNK_CANAnalyzer` — offline CAN payload and signal analysis.
+
+The CAN tool is the producer in the CAN workflow. Its RX CSV is consumed by the
+separate analyzer repository.
+
 ## What Was Built Here
 
 - Initialized Git repository.
@@ -82,14 +91,14 @@ Purpose:
 - Analyze CAN payload bytes over time.
 - Help decode unknown CAN messages in a system.
 
-Expected CSV columns:
+CSV produced by the current Qt tool:
 
-- `Timestamp`
-- `Channel`
-- `ID`
-- `Type`
-- `Length`
-- `Data`
+```text
+Realtime,Seen,FrequencyHz,Channel,ID,Type,Length,Data
+```
+
+The analyzer accepts this schema directly and also recognizes legacy aliases
+such as `Timestamp`, `Frame ID`, `Format`, `DLC`, and `Freq (Hz)`.
 
 Recommended analyzer architecture:
 

@@ -1,6 +1,8 @@
 #pragma once
 
 #include "can_types.h"
+#include "dbc.h"
+#include "dbc_signal_model.h"
 #include "localization.h"
 #include "nmea2000.h"
 #include "rx_frame_table_model.h"
@@ -54,6 +56,7 @@ private slots:
     void exportRxCsv();
     void exportLogCsv();
     void setOperatingMode(int index);
+    void loadDbc();
     void onFramesReceived(const QVector<CanFrame>& frames);
     void onRawFramesReceived(const QVector<CanFrame>& frames);
     void flushPendingRxFrames();
@@ -88,7 +91,7 @@ private:
 
     struct AdapterConfig
     {
-        quint32 deviceIndex = 0;
+        QString deviceKey;
         quint32 channelIndex = 0;
         QString baudRate;
         bool listenOnly = false;
@@ -103,6 +106,9 @@ private:
     void captureTranslationKeys();
     void retranslateUi();
     void appendLog(const QString& message);
+    bool loadDbcFile(const QString& path);
+    void updateDbcSignals(const QVector<CanFrame>& frames);
+    void updateDbcFileLabel();
     void resizeEvent(QResizeEvent* event) override;
 
     void addTxRow(const TxFrame& frame);
@@ -179,6 +185,14 @@ private:
     QTableView* rxTable_ = nullptr;
     RxFrameTableModel* rxModel_ = nullptr;
 
+    QWidget* dbcBar_ = nullptr;
+    QLabel* dbcFileLabel_ = nullptr;
+    QCheckBox* dbcJ1939Check_ = nullptr;
+    QWidget* dbcSignalsPanel_ = nullptr;
+    QLineEdit* dbcSignalFilter_ = nullptr;
+    QTableView* dbcSignalTable_ = nullptr;
+    DbcSignalModel* dbcSignalModel_ = nullptr;
+
     QWidget* watchPanel_ = nullptr;
     QLineEdit* watchId_ = nullptr;
     QLineEdit* watchStartByte_ = nullptr;
@@ -192,8 +206,13 @@ private:
     QTextEdit* logText_ = nullptr;
 
     bool nmeaMode_ = false;
+    bool dbcMode_ = false;
+    Dbc::Database dbc_;
+    QString dbcPath_;
     AppLanguage language_ = AppLanguage::English;
     std::optional<AdapterConfig> savedFaultConfig_;
     Nmea2000::Decoder nmeaDecoder_;
     QVector<CanFrame> nmeaFrames_;
+    QVector<CanFrame> nmeaGroupedFrames_;
+    QHash<QString, int> nmeaGroupedIndex_;
 };

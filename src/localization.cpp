@@ -88,6 +88,21 @@ QString localize(AppLanguage language, const QString& source)
         {QStringLiteral("Select the adapter operating profile. NMEA 2000 is receive-only."), QStringLiteral("Chọn cấu hình bộ chuyển đổi. NMEA 2000 chỉ nhận dữ liệu.")},
         {QStringLiteral("NMEA 2000 monitor: 250 kbit/s, extended IDs, accept all, listen-only"), QStringLiteral("Giám sát NMEA 2000: 250 kbit/s, ID mở rộng, nhận tất cả, chỉ nghe")},
         {QStringLiteral("Fault reading profile: use the selected adapter settings"), QStringLiteral("Cấu hình đọc lỗi: dùng thiết lập bộ chuyển đổi đã chọn")},
+        {QStringLiteral("DBC profile: use the selected adapter settings and decode frames with the loaded DBC"), QStringLiteral("Cấu hình DBC: dùng thiết lập bộ chuyển đổi đã chọn và giải mã khung bằng tệp DBC đã tải")},
+        {QStringLiteral("Load DBC..."), QStringLiteral("Tải DBC...")},
+        {QStringLiteral("No DBC loaded"), QStringLiteral("Chưa tải DBC")},
+        {QStringLiteral("J1939 match"), QStringLiteral("Khớp J1939")},
+        {QStringLiteral("Match extended IDs while ignoring the J1939 source address"), QStringLiteral("Khớp ID mở rộng, bỏ qua địa chỉ nguồn J1939")},
+        {QStringLiteral("Signals"), QStringLiteral("Tín hiệu")},
+        {QStringLiteral("Filter signals"), QStringLiteral("Lọc tín hiệu")},
+        {QStringLiteral("DBC signal values"), QStringLiteral("Giá trị tín hiệu DBC")},
+        {QStringLiteral("Message"), QStringLiteral("Thông điệp")},
+        {QStringLiteral("Signal"), QStringLiteral("Tín hiệu")},
+        {QStringLiteral("Value"), QStringLiteral("Giá trị")},
+        {QStringLiteral("Unit"), QStringLiteral("Đơn vị")},
+        {QStringLiteral("Raw"), QStringLiteral("Thô")},
+        {QStringLiteral("Count"), QStringLiteral("Số lần")},
+        {QStringLiteral("Updated"), QStringLiteral("Cập nhật")},
     };
 
     if (translations.contains(source)) {

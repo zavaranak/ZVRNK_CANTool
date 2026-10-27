@@ -4,15 +4,39 @@
 #include <QMetaType>
 #include <QString>
 
+enum class CanBackend
+{
+    ControlCan,
+    Gvret,
+};
+
 struct CanDeviceInfo
 {
+    CanBackend backend = CanBackend::ControlCan;
     quint32 deviceIndex = 0;
     QString serialNumber;
     QString hardwareType;
     quint8 channelCount = 0;
+    // GVRET serial adapters only.
+    QString portName;
+
+    QString key() const
+    {
+        return backend == CanBackend::Gvret
+            ? QString("gvret:%1").arg(portName)
+            : QString("vci:%1").arg(deviceIndex);
+    }
+
+    QString shortName() const
+    {
+        return backend == CanBackend::Gvret ? portName : QString("Dev %1").arg(deviceIndex);
+    }
 
     QString displayName() const
     {
+        if (backend == CanBackend::Gvret) {
+            return QString("GVRET  %1  %2").arg(portName, hardwareType);
+        }
         return QString("#%1  SN:%2  %3  CH:%4")
             .arg(deviceIndex)
             .arg(serialNumber)

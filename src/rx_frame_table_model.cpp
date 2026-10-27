@@ -15,7 +15,17 @@ int RxFrameTableModel::rowCount(const QModelIndex& parent) const
 
 int RxFrameTableModel::columnCount(const QModelIndex& parent) const
 {
-    return parent.isValid() ? 0 : (nmeaMode_ ? 10 : ColumnCount);
+    if (parent.isValid()) {
+        return 0;
+    }
+    switch (mode_) {
+    case RxViewMode::Nmea:
+        return 10;
+    case RxViewMode::Dbc:
+        return DbcColumnCount;
+    default:
+        return ColumnCount;
+    }
 }
 
 QVariant RxFrameTableModel::data(const QModelIndex& index, int role) const
@@ -25,7 +35,10 @@ QVariant RxFrameTableModel::data(const QModelIndex& index, int role) const
     }
 
     const CanFrame& frame = frames_[index.row()];
-    if (nmeaMode_) {
+    if (mode_ == RxViewMode::Dbc) {
+        return dbcData(frame, index.column(), role);
+    }
+    if (mode_ == RxViewMode::Nmea) {
         if (role == Qt::TextAlignmentRole) {
             switch (index.column()) {
             case 3:
@@ -124,7 +137,20 @@ QVariant RxFrameTableModel::headerData(int section, Qt::Orientation orientation,
         "Data"
     };
 
-    const QStringList& headers = nmeaMode_ ? nmeaHeaders : faultHeaders;
+    static const QStringList dbcHeaders = {
+        "Realtime",
+        "Seen",
+        "FrequencyHz",
+        "Channel",
+        "ID",
+        "Message",
+        "Length",
+        "Data",
+        "Signals"
+    };
+
+    const QStringList& headers = mode_ == RxViewMode::Nmea ? nmeaHeaders
+        : (mode_ == RxViewMode::Dbc ? dbcHeaders : faultHeaders);
     return section >= 0 && section < headers.size()
         ? localize(language_, headers[section])
         : QVariant {};
@@ -150,15 +176,96 @@ void RxFrameTableModel::clear()
     setFrames({});
 }
 
-void RxFrameTableModel::setNmeaMode(bool enabled)
+void RxFrameTableModel::setMode(RxViewMode mode)
 {
-    if (nmeaMode_ == enabled) {
+    if (mode_ == mode) {
         return;
     }
 
     beginResetModel();
-    nmeaMode_ = enabled;
+    mode_ = mode;
     endResetModel();
+}
+
+void RxFrameTableModel::setDbc(const Dbc::Database* database, bool j1939Match)
+{
+    beginResetModel();
+    dbc_ = database;
+    j1939Match_ = j1939Match;
+    endResetModel();
+}
+
+int RxFrameTableModel::stretchColumn() const
+{
+    switch (mode_) {
+    case RxViewMode::Dbc:
+        return DbcSignalsColumn;
+    case RxViewMode::Nmea:
+        return 7;
+    default:
+        return DataColumn;
+    }
+}
+
+QVariant RxFrameTableModel::dbcData(const CanFrame& frame, int column, int role) const
+{
+    if (role == Qt::TextAlignmentRole) {
+        switch (column) {
+        case DbcSeenColumn:
+        case DbcFrequencyColumn:
+        case DbcChannelColumn:
+        case DbcLengthColumn:
+            return int(Qt::AlignRight | Qt::AlignVCenter);
+        default:
+            return int(Qt::AlignLeft | Qt::AlignVCenter);
+        }
+    }
+    if (role != Qt::DisplayRole && role != Qt::ToolTipRole) {
+        return {};
+    }
+
+    // Decoding only the cells on screen keeps large DBCs cheap.
+    const int messageIndex = dbc_ ? dbc_->findMessage(frame.rawId, frame.frameType == "EXT", j1939Match_) : -1;
+    const Dbc::Message* message = messageIndex >= 0 ? &dbc_->messages()[messageIndex] : nullptr;
+
+    if (role == Qt::ToolTipRole) {
+        if (!message || (column != DbcSignalsColumn && column != DbcMessageColumn)) {
+            return {};
+        }
+        QStringList lines;
+        lines << message->name;
+        if (!message->comment.isEmpty()) {
+            lines << message->comment;
+        }
+        for (const Dbc::SignalValue& value : Dbc::decode(*message, frame.dataBytes)) {
+            const Dbc::Signal& signal = message->signalList[value.signalIndex];
+            lines << QString("%1 = %2 %3  (raw %4)").arg(signal.name, Dbc::formatValue(signal, value), signal.unit).arg(value.raw);
+        }
+        return lines.join('\n');
+    }
+
+    switch (column) {
+    case DbcRealtimeColumn:
+        return frame.timestamp;
+    case DbcSeenColumn:
+        return frame.seenCount;
+    case DbcFrequencyColumn:
+        return formatFrequency(frame.receiveFrequencyHz);
+    case DbcChannelColumn:
+        return frame.channel;
+    case DbcIdColumn:
+        return frame.idText;
+    case DbcMessageColumn:
+        return message ? message->name : QStringLiteral("-");
+    case DbcLengthColumn:
+        return frame.length;
+    case DbcDataColumn:
+        return frame.dataText;
+    case DbcSignalsColumn:
+        return message ? Dbc::formatSignals(*message, Dbc::decode(*message, frame.dataBytes)) : QString();
+    default:
+        return {};
+    }
 }
 
 void RxFrameTableModel::setLanguage(AppLanguage language)

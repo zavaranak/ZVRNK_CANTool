@@ -1,4 +1,5 @@
 #include "session_widget.h"
+#include "nmea_dictionary.h"
 
 #include "control_can_native.h"
 #include "formula_evaluator.h"
@@ -10,6 +11,7 @@
 #include <QComboBox>
 #include <QFileDialog>
 #include <QFile>
+#include <QFileInfo>
 #include <QFontDatabase>
 #include <QGridLayout>
 #include <QGroupBox>
@@ -22,6 +24,7 @@
 #include <QPushButton>
 #include <QRegularExpression>
 #include <QResizeEvent>
+#include <QSettings>
 #include <QStyle>
 #include <QSignalBlocker>
 #include <QSizePolicy>
@@ -70,8 +73,10 @@ SessionWidget::SessionWidget(QWidget* parent)
     connect(&service_, &UsbCanService::framesReceived, this, &SessionWidget::onFramesReceived);
     connect(&service_, &UsbCanService::rawFramesReceived, this, &SessionWidget::onRawFramesReceived);
     connect(&service_, &UsbCanService::logEmitted, this, &SessionWidget::onLogEmitted);
+    connect(&service_, &UsbCanService::connectionLost, this, &SessionWidget::disconnectDevice);
 
     refreshDevices();
+    updateDbcFileLabel();
     updateConnectionState();
 }
 
@@ -137,7 +142,7 @@ void SessionWidget::buildUi()
     modeCombo_->addItem("Listen Only", "Listen Only");
     filterCombo_->addItem("Accept All", "Accept All");
     filterCombo_->addItem("Single Filter", "Single Filter");
-    profileCombo_->addItems({"Fault Reading", "NMEA 2000"});
+    profileCombo_->addItems({"Fault Reading", "NMEA 2000", "DBC"});
     profileCombo_->setToolTip("Select the adapter operating profile. NMEA 2000 is receive-only.");
 
     auto* identityRow = new QHBoxLayout();
@@ -188,6 +193,18 @@ void SessionWidget::buildUi()
     connect(disconnectButton_, &QPushButton::clicked, this, &SessionWidget::disconnectDevice);
     connect(closeButton, &QPushButton::clicked, this, &SessionWidget::closeRequested);
     connect(profileCombo_, qOverload<int>(&QComboBox::currentIndexChanged), this, &SessionWidget::setOperatingMode);
+    connect(modeCombo_, qOverload<int>(&QComboBox::currentIndexChanged), this, [this] {
+        if (!nmeaMode_) {
+            return;
+        }
+        const bool wasConnected = service_.isConnected();
+        if (wasConnected) {
+            service_.disconnectDevice();
+            emit headerChanged("Disconnected");
+            connectDevice();
+        }
+        updateConnectionState();
+    });
 
     middleSplitter_ = new QSplitter(Qt::Horizontal, this);
     middleSplitter_->setObjectName("panelSplitter");
@@ -275,6 +292,25 @@ void SessionWidget::buildUi()
     rxTop->addWidget(clearRxButton);
     rxLayout->addLayout(rxTop);
 
+    dbcBar_ = new QWidget(rxBox);
+    auto* dbcLayout = new QHBoxLayout(dbcBar_);
+    dbcLayout->setContentsMargins(0, 0, 0, 0);
+    auto* loadDbcButton = new QPushButton("Load DBC...", dbcBar_);
+    loadDbcButton->setObjectName("primaryButton");
+    loadDbcButton->setProperty("variant", "primary");
+    dbcFileLabel_ = new QLabel(dbcBar_);
+    dbcFileLabel_->setProperty("dynamicText", true);
+    dbcFileLabel_->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    dbcJ1939Check_ = new QCheckBox("J1939 match", dbcBar_);
+    dbcJ1939Check_->setToolTip("Match extended IDs while ignoring the J1939 source address");
+    dbcJ1939Check_->setChecked(QSettings().value("dbc/j1939Match", false).toBool());
+    dbcLayout->addWidget(loadDbcButton);
+    dbcLayout->addWidget(dbcFileLabel_, 1);
+    dbcLayout->addWidget(dbcJ1939Check_);
+    dbcBar_->setVisible(false);
+    rxLayout->addWidget(dbcBar_);
+    connect(loadDbcButton, &QPushButton::clicked, this, &SessionWidget::loadDbc);
+
     auto* filters = new QGridLayout();
     rxFilterId_ = new QLineEdit(rxBox);
     rxFilterType_ = new QComboBox(rxBox);
@@ -353,7 +389,56 @@ void SessionWidget::buildUi()
     rxTable_->setFont(QFontDatabase::systemFont(QFontDatabase::FixedFont));
     rxTable_->verticalHeader()->setSectionResizeMode(QHeaderView::Fixed);
     rxTable_->verticalHeader()->setDefaultSectionSize(24);
-    rxLayout->addWidget(rxTable_, 1);
+
+    dbcSignalsPanel_ = new QWidget(rxBox);
+    relaxSplitterChild(dbcSignalsPanel_);
+    auto* signalsLayout = new QVBoxLayout(dbcSignalsPanel_);
+    signalsLayout->setContentsMargins(0, 0, 0, 0);
+    auto* signalsTitle = new QLabel("Signals", dbcSignalsPanel_);
+    dbcSignalFilter_ = new QLineEdit(dbcSignalsPanel_);
+    dbcSignalFilter_->setPlaceholderText("Filter signals");
+    auto* signalsHeader = new QHBoxLayout();
+    signalsHeader->addWidget(signalsTitle);
+    signalsHeader->addWidget(dbcSignalFilter_, 1);
+    signalsLayout->addLayout(signalsHeader);
+    dbcSignalModel_ = new DbcSignalModel(this);
+    dbcSignalModel_->setDatabase(&dbc_);
+    dbcSignalTable_ = new QTableView(dbcSignalsPanel_);
+    relaxTableView(dbcSignalTable_);
+    dbcSignalTable_->setModel(dbcSignalModel_);
+    dbcSignalTable_->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Stretch);
+    dbcSignalTable_->verticalHeader()->setVisible(false);
+    dbcSignalTable_->verticalHeader()->setSectionResizeMode(QHeaderView::Fixed);
+    dbcSignalTable_->verticalHeader()->setDefaultSectionSize(24);
+    dbcSignalTable_->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    dbcSignalTable_->setSelectionBehavior(QAbstractItemView::SelectRows);
+    dbcSignalTable_->setSelectionMode(QAbstractItemView::SingleSelection);
+    dbcSignalTable_->setAlternatingRowColors(true);
+    dbcSignalTable_->setShowGrid(false);
+    dbcSignalTable_->setWordWrap(false);
+    dbcSignalTable_->setFont(QFontDatabase::systemFont(QFontDatabase::FixedFont));
+    dbcSignalTable_->setAccessibleName("DBC signal values");
+    signalsLayout->addWidget(dbcSignalTable_, 1);
+    dbcSignalsPanel_->setVisible(false);
+    connect(dbcSignalFilter_, &QLineEdit::textChanged, this, [this](const QString& text) {
+        dbcSignalModel_->setFilter(text);
+    });
+    connect(dbcJ1939Check_, &QCheckBox::toggled, this, [this](bool checked) {
+        rxModel_->setDbc(&dbc_, checked);
+        dbcSignalModel_->clear();
+        QSettings().setValue("dbc/j1939Match", checked);
+        refreshRxTable();
+    });
+
+    auto* rxSplitter = new QSplitter(Qt::Vertical, rxBox);
+    rxSplitter->setChildrenCollapsible(true);
+    rxSplitter->setOpaqueResize(true);
+    rxSplitter->setHandleWidth(5);
+    rxSplitter->addWidget(rxTable_);
+    rxSplitter->addWidget(dbcSignalsPanel_);
+    rxSplitter->setStretchFactor(0, 3);
+    rxSplitter->setStretchFactor(1, 2);
+    rxLayout->addWidget(rxSplitter, 1);
     middleSplitter_->addWidget(rxBox);
     middleSplitter_->setStretchFactor(0, 4);
     middleSplitter_->setStretchFactor(1, 6);
@@ -523,6 +608,8 @@ void SessionWidget::retranslateUi()
         }
     }
     rxModel_->setLanguage(language_);
+    dbcSignalModel_->setLanguage(language_);
+    updateDbcFileLabel();
 }
 
 void SessionWidget::updateAdaptiveLayout()
@@ -552,17 +639,21 @@ void SessionWidget::resizeEvent(QResizeEvent* event)
 
 void SessionWidget::refreshDevices()
 {
-    QString error;
-    devices_ = ControlCanNative::instance().findDevices(&error);
+    QString controlCanError;
+    devices_ = UsbCanService::findDevices(&controlCanError);
     deviceCombo_->clear();
     for (const auto& device : devices_) {
-        deviceCombo_->addItem(device.displayName(), device.deviceIndex);
+        deviceCombo_->addItem(device.displayName(), device.key());
     }
-    if (!error.isEmpty()) {
-        appendLog(QString("Device discovery failed: %1").arg(error));
-    } else {
-        appendLog(QString("Device list refreshed. Found %1 device(s).").arg(devices_.size()));
+    if (!controlCanError.isEmpty()) {
+        appendLog(QString("ControlCAN adapters unavailable: %1").arg(controlCanError));
     }
+    const auto serialCount = std::count_if(devices_.cbegin(), devices_.cend(), [](const CanDeviceInfo& device) {
+        return device.backend == CanBackend::Gvret;
+    });
+    appendLog(QString("Device list refreshed. Found %1 ControlCAN device(s) and %2 serial port(s) for GVRET.")
+                  .arg(devices_.size() - serialCount)
+                  .arg(serialCount));
 }
 
 void SessionWidget::connectDevice()
@@ -571,15 +662,21 @@ void SessionWidget::connectDevice()
         if (deviceCombo_->currentIndex() < 0) {
             throw std::runtime_error("Select a device first.");
         }
-        const quint32 deviceIndex = deviceCombo_->currentData().toUInt();
+        const QString deviceKey = deviceCombo_->currentData().toString();
+        const auto device = std::find_if(devices_.cbegin(), devices_.cend(), [&deviceKey](const CanDeviceInfo& candidate) {
+            return candidate.key() == deviceKey;
+        });
+        if (device == devices_.cend()) {
+            throw std::runtime_error("Selected device is no longer listed. Refresh the device list.");
+        }
         const quint32 channelIndex = channelCombo_->currentText().toUInt();
         const QString baudRate = nmeaMode_ ? QStringLiteral("250K") : baudCombo_->currentText();
         const bool listenOnly = nmeaMode_ || modeCombo_->currentData().toString() == "Listen Only";
         const bool singleFilter = !nmeaMode_ && filterCombo_->currentData().toString() == "Single Filter";
 
         service_.setNmeaMonitorMode(nmeaMode_);
-        service_.connectDevice(deviceIndex, channelIndex, baudRate, listenOnly, singleFilter);
-        emit headerChanged(QString("Dev %1 / CH %2").arg(deviceIndex).arg(channelIndex));
+        service_.connectDevice(*device, channelIndex, baudRate, listenOnly, singleFilter);
+        emit headerChanged(QString("%1 / CH %2").arg(device->shortName()).arg(channelIndex));
         updateConnectionState();
     } catch (const std::exception& ex) {
         appendLog(QString("Connect failed: %1").arg(ex.what()));
@@ -590,15 +687,19 @@ void SessionWidget::connectDevice()
 void SessionWidget::setOperatingMode(int index)
 {
     const bool requestedNmeaMode = index == 1;
-    if (requestedNmeaMode == nmeaMode_) {
+    const bool requestedDbcMode = index == 2;
+    if (requestedNmeaMode == nmeaMode_ && requestedDbcMode == dbcMode_) {
         updateOperatingModeUi();
         return;
     }
 
+    // Fault reading and DBC share adapter settings, so only entering or
+    // leaving NMEA 2000 needs a reconnect.
+    const bool nmeaChanged = requestedNmeaMode != nmeaMode_;
     const bool wasConnected = service_.isConnected();
-    if (requestedNmeaMode) {
+    if (nmeaChanged && requestedNmeaMode) {
         AdapterConfig config;
-        config.deviceIndex = deviceCombo_->currentData().toUInt();
+        config.deviceKey = deviceCombo_->currentData().toString();
         config.channelIndex = channelCombo_->currentText().toUInt();
         config.baudRate = baudCombo_->currentText();
         config.listenOnly = modeCombo_->currentData().toString() == "Listen Only";
@@ -613,6 +714,8 @@ void SessionWidget::setOperatingMode(int index)
         nmeaMode_ = true;
         nmeaDecoder_.reset();
         nmeaFrames_.clear();
+        nmeaGroupedFrames_.clear();
+        nmeaGroupedIndex_.clear();
         pendingRxFrames_.clear();
         stopTxQueueLoop();
         stopAllCycleLoops();
@@ -621,11 +724,14 @@ void SessionWidget::setOperatingMode(int index)
             const QSignalBlocker modeBlocker(modeCombo_);
             const QSignalBlocker filterBlocker(filterCombo_);
             baudCombo_->setCurrentText("250K");
-            modeCombo_->setCurrentIndex(modeCombo_->findData("Listen Only"));
+            // Normal controller mode is still receive-only at the application
+            // layer, but it emits CAN ACK bits. Some NMEA senders will not
+            // publish engine PGNs when every receiver is listen-only.
+            modeCombo_->setCurrentIndex(modeCombo_->findData("Normal"));
             filterCombo_->setCurrentIndex(filterCombo_->findData("Accept All"));
         }
         service_.setNmeaMonitorMode(true);
-    } else {
+    } else if (nmeaChanged) {
         if (wasConnected) {
             service_.disconnectDevice();
             emit headerChanged("Disconnected");
@@ -635,11 +741,13 @@ void SessionWidget::setOperatingMode(int index)
         service_.setNmeaMonitorMode(false);
         nmeaDecoder_.reset();
         nmeaFrames_.clear();
+        nmeaGroupedFrames_.clear();
+        nmeaGroupedIndex_.clear();
         pendingRxFrames_.clear();
 
         if (savedFaultConfig_) {
             const AdapterConfig config = *savedFaultConfig_;
-            const int deviceIndex = deviceCombo_->findData(config.deviceIndex);
+            const int deviceIndex = deviceCombo_->findData(config.deviceKey);
             const QSignalBlocker deviceBlocker(deviceCombo_);
             const QSignalBlocker channelBlocker(channelCombo_);
             const QSignalBlocker baudBlocker(baudCombo_);
@@ -656,13 +764,99 @@ void SessionWidget::setOperatingMode(int index)
         savedFaultConfig_.reset();
     }
 
+    dbcMode_ = requestedDbcMode;
+    if (dbcMode_ && dbc_.isEmpty()) {
+        const QString lastPath = QSettings().value("dbc/lastPath").toString();
+        if (lastPath.isEmpty() || !QFileInfo::exists(lastPath) || !loadDbcFile(lastPath)) {
+            loadDbc();
+        }
+    }
+
     updateOperatingModeUi();
     updateConnectionState();
     refreshRxTable();
 
-    if (wasConnected) {
+    if (nmeaChanged && wasConnected) {
         connectDevice();
     }
+}
+
+void SessionWidget::loadDbc()
+{
+    QString startPath = dbcPath_;
+    if (startPath.isEmpty()) {
+        startPath = QSettings().value("dbc/lastPath", canToolDocumentsPath()).toString();
+    }
+    const QString path = QFileDialog::getOpenFileName(this, "Load DBC", startPath, "DBC files (*.dbc);;All files (*.*)");
+    if (!path.isEmpty()) {
+        loadDbcFile(path);
+    }
+}
+
+bool SessionWidget::loadDbcFile(const QString& path)
+{
+    Dbc::Database database;
+    QString error;
+    if (!database.loadFile(path, &error)) {
+        appendLog(QString("DBC load failed (%1): %2").arg(QFileInfo(path).fileName(), error));
+        QMessageBox::warning(this, "DBC Load Error", QString("%1\n\n%2").arg(path, error));
+        return false;
+    }
+
+    // Detach the views before the database they point at is replaced.
+    rxModel_->setDbc(nullptr, false);
+    dbcSignalModel_->setDatabase(nullptr);
+    dbc_ = std::move(database);
+    dbcPath_ = path;
+    rxModel_->setDbc(&dbc_, dbcJ1939Check_->isChecked());
+    dbcSignalModel_->setDatabase(&dbc_);
+    QSettings().setValue("dbc/lastPath", path);
+
+    // Rebuild signal values from frames already on screen.
+    QVector<CanFrame> existing(groupedFrames_.crbegin(), groupedFrames_.crend());
+    updateDbcSignals(existing);
+
+    updateDbcFileLabel();
+    appendLog(QString("DBC loaded: %1 (%2 messages, %3 signals).")
+                  .arg(QFileInfo(path).fileName())
+                  .arg(dbc_.messages().size())
+                  .arg(dbc_.signalCount()));
+    refreshRxTable();
+    return true;
+}
+
+void SessionWidget::updateDbcSignals(const QVector<CanFrame>& frames)
+{
+    if (dbc_.isEmpty()) {
+        return;
+    }
+
+    const bool j1939Match = dbcJ1939Check_->isChecked();
+    for (const CanFrame& frame : frames) {
+        const int message = dbc_.findMessage(frame.rawId, frame.frameType == "EXT", j1939Match);
+        if (message < 0) {
+            continue;
+        }
+        dbcSignalModel_->update(message, Dbc::decode(dbc_.messages()[message], frame.dataBytes), frame.timestamp, frame.seenCount);
+    }
+    dbcSignalModel_->publish();
+}
+
+void SessionWidget::updateDbcFileLabel()
+{
+    if (!dbcFileLabel_) {
+        return;
+    }
+    if (dbc_.isEmpty()) {
+        dbcFileLabel_->setText(localize(language_, "No DBC loaded"));
+        dbcFileLabel_->setToolTip({});
+        return;
+    }
+    dbcFileLabel_->setText(QString("%1  [%2 msg / %3 sig]")
+                               .arg(QFileInfo(dbcPath_).fileName())
+                               .arg(dbc_.messages().size())
+                               .arg(dbc_.signalCount()));
+    dbcFileLabel_->setToolTip(QString("%1\n%2 messages, %3 signals").arg(dbcPath_).arg(dbc_.messages().size()).arg(dbc_.signalCount()));
 }
 
 void SessionWidget::disconnectDevice()
@@ -704,10 +898,13 @@ void SessionWidget::clearRxFrames()
     allFrames_.clear();
     groupedFrames_.clear();
     nmeaFrames_.clear();
+    nmeaGroupedFrames_.clear();
+    nmeaGroupedIndex_.clear();
     pendingRxFrames_.clear();
     groupedIndex_.clear();
     rxStats_.clear();
     nmeaDecoder_.reset();
+    dbcSignalModel_->clear();
     refreshRxTable();
 }
 
@@ -825,7 +1022,8 @@ void SessionWidget::exportRxCsv()
     }
 
     QTextStream out(&file);
-    out << "Realtime,Seen,FrequencyHz,Channel,ID,Type,Length,Data\n";
+    out << "Realtime,Seen,FrequencyHz,Channel,ID,Type,Length,Data";
+    out << (dbcMode_ ? ",Message,Signals\n" : "\n");
     for (const CanFrame& frame : activeRxFrames()) {
         if (!frameMatchesFilters(frame)) {
             continue;
@@ -838,7 +1036,17 @@ void SessionWidget::exportRxCsv()
             << csv(displayFrame.idText) << ','
             << csv(displayFrame.frameType) << ','
             << displayFrame.length << ','
-            << csv(displayFrame.dataText) << '\n';
+            << csv(displayFrame.dataText);
+        if (dbcMode_) {
+            const int message = dbc_.findMessage(displayFrame.rawId, displayFrame.frameType == "EXT", dbcJ1939Check_->isChecked());
+            if (message >= 0) {
+                const Dbc::Message& definition = dbc_.messages()[message];
+                out << ',' << csv(definition.name) << ',' << csv(Dbc::formatSignals(definition, Dbc::decode(definition, displayFrame.dataBytes)));
+            } else {
+                out << ",,";
+            }
+        }
+        out << '\n';
     }
     appendLog(QString("RX CSV exported: %1").arg(path));
 }
@@ -909,11 +1117,26 @@ void SessionWidget::onRawFramesReceived(const QVector<CanFrame>& frames)
         decoded.nmeaDestination = info.destination;
         decoded.nmeaTransport = info.transport;
         decoded.nmeaDecoded = info.decoded;
+        const QString schemaDecoded = NmeaDictionary::decode(info.pgn, info.payload);
+        if (!schemaDecoded.isEmpty()) {
+            decoded.nmeaDecoded = schemaDecoded;
+        }
         decodedFrames.push_back(decoded);
     }
 
     for (auto it = decodedFrames.crbegin(); it != decodedFrames.crend(); ++it) {
         nmeaFrames_.prepend(*it);
+        const QString key = groupedKey(*it);
+        const auto grouped = nmeaGroupedIndex_.constFind(key);
+        if (grouped == nmeaGroupedIndex_.cend()) {
+            nmeaGroupedFrames_.prepend(*it);
+            nmeaGroupedIndex_.clear();
+            for (int index = 0; index < nmeaGroupedFrames_.size(); ++index) {
+                nmeaGroupedIndex_[groupedKey(nmeaGroupedFrames_[index])] = index;
+            }
+        } else {
+            nmeaGroupedFrames_[grouped.value()] = *it;
+        }
     }
     if (nmeaFrames_.size() > 500) {
         nmeaFrames_.remove(500, nmeaFrames_.size() - 500);
@@ -935,6 +1158,9 @@ void SessionWidget::flushPendingRxFrames()
         frames.push_back(pendingRxFrames_[i]);
     }
     pendingRxFrames_.remove(0, takeCount);
+    if (dbcMode_) {
+        updateDbcSignals(frames);
+    }
 
     QVector<CanFrame> displayFrames;
     displayFrames.reserve(qMin(500, frames.size() + allFrames_.size()));
@@ -975,7 +1201,9 @@ void SessionWidget::updateConnectionState()
     const bool connected = service_.isConnected();
     connectButton_->setEnabled(!connected);
     disconnectButton_->setEnabled(connected);
-    const QString connectionText = connected ? (nmeaMode_ ? "NMEA / LISTEN ONLY" : "CONNECTED") : "DISCONNECTED";
+    const QString connectionText = connected
+        ? (nmeaMode_ ? QString("NMEA / %1").arg(modeCombo_->currentData().toString().toUpper()) : QStringLiteral("CONNECTED"))
+        : QStringLiteral("DISCONNECTED");
     connectionStatus_->setText(localize(language_, connectionText));
     connectionStatus_->setProperty("state", connected ? "success" : "inactive");
     connectionStatus_->style()->unpolish(connectionStatus_);
@@ -994,15 +1222,23 @@ void SessionWidget::updateOperatingModeUi()
     const bool connected = service_.isConnected();
     const bool nmea = nmeaMode_;
     baudCombo_->setEnabled(!nmea);
-    modeCombo_->setEnabled(!nmea);
+    modeCombo_->setEnabled(true);
     filterCombo_->setEnabled(!nmea);
-    groupFramesCheck_->setEnabled(!nmea);
+    // Grouping is a display option and remains available for NMEA traffic.
+    groupFramesCheck_->setEnabled(true);
     txBox_->setEnabled(!nmea);
     txBox_->setTitle(localize(language_, nmea ? "Transmit (disabled in NMEA 2000)" : "Transmit"));
     profileCombo_->setToolTip(localize(language_, nmea
-        ? "NMEA 2000 monitor: 250 kbit/s, extended IDs, accept all, listen-only"
-        : "Fault reading profile: use the selected adapter settings"));
-    rxModel_->setNmeaMode(nmea);
+        ? "NMEA 2000 monitor: 250 kbit/s, extended IDs, accept all; Normal mode ACKs frames, Listen Only does not"
+        : (dbcMode_ ? "DBC profile: use the selected adapter settings and decode frames with the loaded DBC"
+                    : "Fault reading profile: use the selected adapter settings")));
+    rxModel_->setMode(nmea ? RxViewMode::Nmea : (dbcMode_ ? RxViewMode::Dbc : RxViewMode::Fault));
+    for (int column = 0; column < rxModel_->columnCount(); ++column) {
+        rxTable_->horizontalHeader()->setSectionResizeMode(column, QHeaderView::Interactive);
+    }
+    rxTable_->horizontalHeader()->setSectionResizeMode(rxModel_->stretchColumn(), QHeaderView::Stretch);
+    dbcBar_->setVisible(dbcMode_);
+    dbcSignalsPanel_->setVisible(dbcMode_);
     if (nmea && connected) {
         connectionStatus_->setProperty("state", "success");
     }
@@ -1339,8 +1575,29 @@ void SessionWidget::applyRxStatsToFrame(CanFrame& frame, const RxFrameStats& sta
 bool SessionWidget::frameMatchesFilters(const CanFrame& frame) const
 {
     const QString idFilter = rxFilterId_->text().trimmed();
-    if (!idFilter.isEmpty() && !frame.idText.contains(idFilter, Qt::CaseInsensitive)) {
-        return false;
+    if (!idFilter.isEmpty()) {
+        QString normalizedFilter = idFilter;
+        if (normalizedFilter.startsWith("0x", Qt::CaseInsensitive)) {
+            normalizedFilter = normalizedFilter.mid(2);
+        }
+        const QString normalizedId = frame.idText.startsWith("0x", Qt::CaseInsensitive)
+            ? frame.idText.mid(2)
+            : frame.idText;
+        const QString pgnText = frame.nmeaValid ? frame.nmeaPgnText : QString();
+        const QString pgnDecimal = frame.nmeaValid ? QString::number(frame.nmeaPgn) : QString();
+        QString dbcName;
+        if (dbcMode_) {
+            const int message = dbc_.findMessage(frame.rawId, frame.frameType == "EXT", dbcJ1939Check_->isChecked());
+            if (message >= 0) {
+                dbcName = dbc_.messages()[message].name;
+            }
+        }
+        if (!normalizedId.contains(normalizedFilter, Qt::CaseInsensitive)
+            && !pgnText.contains(idFilter, Qt::CaseInsensitive)
+            && !pgnDecimal.contains(idFilter, Qt::CaseInsensitive)
+            && !dbcName.contains(idFilter, Qt::CaseInsensitive)) {
+            return false;
+        }
     }
 
     const QString type = rxFilterType_->currentData().toString();
@@ -1372,7 +1629,7 @@ void SessionWidget::refreshRxTable()
 const QVector<CanFrame>& SessionWidget::activeRxFrames() const
 {
     if (nmeaMode_) {
-        return nmeaFrames_;
+        return groupFramesCheck_->isChecked() ? nmeaGroupedFrames_ : nmeaFrames_;
     }
     return groupFramesCheck_->isChecked() ? groupedFrames_ : allFrames_;
 }

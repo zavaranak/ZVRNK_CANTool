@@ -47,12 +47,50 @@ The application keeps the same functional architecture:
 ## Requirements
 
 - Windows x64
-- Qt 6 Widgets development kit
+- Qt 6 Widgets and SerialPort development kit
 - CMake 3.24 or newer
 - C++20 compiler compatible with the selected Qt kit
-- Vendor `ControlCAN.dll`
+- Vendor `ControlCAN.dll` (only for ControlCAN adapters such as the Waveshare USB-CAN-B)
+
+## Supported adapters
+
+- **ControlCAN (VCI) adapters**, such as the Waveshare USB-CAN-B. They need the
+  vendor USB driver installed on each PC and `ControlCAN.dll` beside the exe.
+- **GVRET serial adapters**, the protocol SavvyCAN calls "Serial Connection
+  (GVRET)", for example an ESP32 with a CAN transceiver. They appear in the
+  device list as `GVRET  COMx ...`. No DLL is needed, and the board must not be
+  open in SavvyCAN at the same time. GVRET has no hardware filter (the app
+  always accepts all IDs) and cannot send RTR frames.
 
 Build details are documented in [bullding-step.md](bullding-step.md).
+
+## DBC mode
+
+Choose the **DBC** profile and load a `.dbc` file. The last file is remembered
+and reloads automatically. This mode uses the normal adapter settings, and
+transmit stays enabled.
+
+- The received table adds a **Message** column (name from the DBC) and a
+  **Signals** column with decoded physical values. Hover a row to see every
+  signal on its own line.
+- The **Signals** table lists the latest value, unit, raw value, count and
+  update time for every signal seen. You can filter it by signal or message
+  name.
+- The ID filter also matches DBC message names. RX CSV export adds the
+  Message and Signals columns.
+- **J1939 match** pairs extended IDs with DBC messages while ignoring the
+  source address byte. Use it for J1939 DBCs whose IDs carry a fixed source
+  address.
+- Supported DBC features: Intel and Motorola byte order, signed signals,
+  scaling, units, value tables (`VAL_`), simple multiplexing (`M` / `mN`) and
+  comments. Float signals (`SIG_VALTYPE_`) and extended multiplexing are not
+  decoded.
+
+## UI scale
+
+The UI is drawn at 80% of the Windows display scale. To override it, set the
+`QT_SCALE_FACTOR` environment variable before starting the app, for example
+`1.0` for the original size.
 
 ## Typical workflow
 
@@ -106,6 +144,10 @@ Keep the exported CSV unchanged when moving it between the two applications.
   CSV actions, and event log.
 - `src/usb_can_service.*` — threaded CAN connection and receive loop.
 - `src/control_can_native.*` — dynamic `ControlCAN.dll` loading and VCI calls.
+- `src/dbc.*` — DBC parser and signal decoder (tested by `tests/dbc_test.cpp`).
+- `src/dbc_signal_model.*` — latest-value table for DBC signals.
+- `src/gvret_protocol.*` — GVRET serial command encoding and stream parser
+  (tested by `tests/gvret_protocol_test.cpp`).
 - `src/formula_evaluator.*` — watch-value formula evaluation.
 
 ## Receive Frequency Formula

@@ -7,7 +7,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTORCC ON)
 
-find_package(Qt6 REQUIRED COMPONENTS Widgets)
+find_package(Qt6 REQUIRED COMPONENTS Widgets SerialPort)
 
 qt_add_executable(ZVRNK_CANTool
     src/main.cpp
@@ -19,6 +19,8 @@ qt_add_executable(ZVRNK_CANTool
     src/localization.h
     src/nmea2000.cpp
     src/nmea2000.h
+    src/nmea_dictionary.cpp
+    src/nmea_dictionary.h
     src/session_widget.cpp
     src/session_widget.h
     src/rx_frame_table_model.cpp
@@ -27,7 +29,13 @@ qt_add_executable(ZVRNK_CANTool
     src/usb_can_service.h
     src/control_can_native.cpp
     src/control_can_native.h
+    src/gvret_protocol.cpp
+    src/gvret_protocol.h
     src/can_types.h
+    src/dbc.cpp
+    src/dbc.h
+    src/dbc_signal_model.cpp
+    src/dbc_signal_model.h
     src/formula_evaluator.cpp
     src/formula_evaluator.h
 )
@@ -38,7 +46,7 @@ else()
     message(STATUS "assets/logo.png not found. Add it and rerun CMake to enable the app logo.")
 endif()
 
-target_link_libraries(ZVRNK_CANTool PRIVATE Qt6::Widgets)
+target_link_libraries(ZVRNK_CANTool PRIVATE Qt6::Widgets Qt6::SerialPort)
 
 if(WIN32)
     target_compile_definitions(ZVRNK_CANTool PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -59,4 +67,18 @@ elseif(CONTROLCAN_DLL_PATH)
     message(WARNING "CONTROLCAN_DLL_PATH does not exist: ${CONTROLCAN_DLL_PATH}")
 else()
     message(WARNING "CONTROLCAN_DLL_PATH is not set. Copy ControlCAN.dll beside the executable before running.")
+endif()
+
+option(ZVRNK_BUILD_TESTS "Build protocol unit tests" ON)
+if(ZVRNK_BUILD_TESTS)
+    enable_testing()
+    add_executable(gvret_protocol_test tests/gvret_protocol_test.cpp src/gvret_protocol.cpp)
+    target_include_directories(gvret_protocol_test PRIVATE src)
+    target_link_libraries(gvret_protocol_test PRIVATE Qt6::Core)
+    add_test(NAME gvret_protocol_test COMMAND gvret_protocol_test)
+
+    add_executable(dbc_test tests/dbc_test.cpp src/dbc.cpp)
+    target_include_directories(dbc_test PRIVATE src)
+    target_link_libraries(dbc_test PRIVATE Qt6::Core)
+    add_test(NAME dbc_test COMMAND dbc_test)
 endif()
